@@ -6,17 +6,26 @@ from pathlib import Path
 from typing import Any
 
 from . import repository as repo
-from .curator import deduplicate_check, needs_verification, type_required_fields, validate_status
+from .curator import ModelCuratorAdapter, RuleCurator, deduplicate_check, needs_verification, type_required_fields, validate_status
 from .db import get_connection, init_db
 from .models import (
     BrainAskRequest,
     BrainAskResponse,
+    BrainCurateRequest,
+    BrainCurateResponse,
     BrainHandoverRequest,
     BrainHandoverResponse,
     BrainOnboardRequest,
     BrainOnboardResponse,
     BrainRecordRequest,
     BrainRecordResponse,
+    BrainReviewApplyRequest,
+    BrainReviewApplyResponse,
+    BrainReviewListRequest,
+    BrainReviewListResponse,
+    BrainSnapshotRequest,
+    BrainSnapshotResponse,
+    IngestRequest,
     content_to_text,
     now_iso,
 )
@@ -48,7 +57,41 @@ def _answer_from_row(row: dict[str, Any]) -> str:
     return str(c)[:200]
 
 
+def brain_ingest(req: IngestRequest, db_path: str | Path | None = None) -> dict[str, Any]:
+    from .ingestion import ingest_file, ingest_git, ingest_test
+
+    pid = req.project_id
+    source = req.source
+    if source == "git":
+        return ingest_git(project_id=pid, agent_id=req.agent_id, session_id=req.session_id, cwd=req.payload.get("cwd"), db_path=db_path)
+    if source == "test":
+        return ingest_test(project_id=pid, command=req.payload.get("command", "make test"), agent_id=req.agent_id, session_id=req.session_id, cwd=req.payload.get("cwd"), db_path=db_path, log_path=req.payload.get("log_path"))
+    if source == "file":
+        return ingest_file(project_id=pid, path=req.payload.get("path", "."), agent_id=req.agent_id, session_id=req.session_id, db_path=db_path)
+    conn = ensure_db(db_path)
+    try:
+        dedup_key = req.payload.get("dedup_key")
+        ev_id = repo.create_event(conn, project_id=pid, action=req.payload.get("action", "record"), source=source, result=req.payload.get("result", "observed"), agent_id=req.agent_id, session_id=req.session_id, target=req.payload.get("target"), summary=req.payload.get("summary", source), payload=req.payload, dedup_key=dedup_key)
+        conn.commit()
+        return {"event_id": ev_id, "warnings": []}
+    finally:
+        conn.close()
+
+
 def brain_record(req: BrainRecordRequest, db_path: str | Path | None = None) -> BrainRecordResponse:
+    if any((r.origin or "user") == "model_curator" and (r.status in ("verified", "active")) for r in req.records):
+        warnings_extra: list[str] = []
+        proposals_created: list[str] = []
+        conn2 = ensure_db(db_path)
+        try:
+            for r in req.records:
+                if (r.origin or "") == "model_curator" and r.status in ("verified", "active"):
+                    warnings_extra.append(f"model_curator cannot request {r.status}, downgraded to proposal")
+                    repo.create_proposal(conn2, project_id=req.project_id, action="create_memory", payload={"type": r.type, "content": r.content, "status": r.status}, reason="model_curator verified request must be reviewed", source_event_ids=[], confidence=r.confidence, curator_version="model-v0", origin="model_curator")
+                    r.status = "proposed"
+            conn2.commit()
+        finally:
+            conn2.close()
     conn = ensure_db(db_path)
     pid = req.project_id
     accepted: list[str] = []
@@ -145,6 +188,12 @@ def brain_record(req: BrainRecordRequest, db_path: str | Path | None = None) -> 
                 tags=rec.tags,
                 created_by=req.agent_id,
                 project_id=pid,
+                valid_from=rec.valid_from,
+                valid_until=rec.valid_until,
+                branch=rec.branch,
+                commit_hash=rec.commit_hash,
+                verification_due_at=rec.verification_due_at,
+                origin=rec.origin or "user",
             )
             accepted.append(mem_id)
             existing_texts.append(text)
@@ -208,8 +257,55 @@ def brain_ask(req: BrainAskRequest, db_path: str | Path | None = None) -> BrainA
     conn = ensure_db(db_path)
     pid = req.project_id
     try:
-        match_mode, results, matches = ranked_search(conn, req.question, scope=req.scope, limit=req.limit, project_id=pid)
-        facts = [{"id": r["id"], "type": r["type"], "status": r["status"], "task_status": r.get("task_status")} for r in results]
+        match_mode, results, matches = ranked_search(conn, req.question, scope=req.scope, limit=req.limit, project_id=pid, as_of_commit=req.as_of_commit, as_of_time=req.as_of_time)
+        # filter by valid window if as_of_time
+        if req.as_of_time:
+            try:
+                from datetime import datetime, timezone
+
+                as_of = datetime.fromisoformat(req.as_of_time.replace("Z", "+00:00"))
+                filtered = []
+                for r in results:
+                    vf = r.get("valid_from")
+                    vu = r.get("valid_until")
+                    if vf:
+                        try:
+                            if datetime.fromisoformat(vf.replace("Z", "+00:00")) > as_of:
+                                continue
+                        except Exception:
+                            pass
+                    if vu:
+                        try:
+                            if datetime.fromisoformat(vu.replace("Z", "+00:00")) < as_of:
+                                continue
+                        except Exception:
+                            pass
+                    filtered.append(r)
+                results = filtered
+            except Exception:
+                pass
+        # stale detection: valid_until passed
+        stale_facts: list[dict[str, Any]] = []
+        fresh: list[dict[str, Any]] = []
+        for r in results:
+            vu = r.get("valid_until")
+            is_stale = False
+            if vu:
+                try:
+                    from datetime import datetime, timezone
+
+                    if datetime.fromisoformat(vu.replace("Z", "+00:00")) < datetime.now(timezone.utc):
+                        is_stale = True
+                except Exception:
+                    pass
+            if is_stale:
+                r2 = dict(r)
+                stale_facts.append({"id": r2["id"], "type": r2["type"], "status": r2["status"], "kind": "stale_fact", "provenance": [lk["to_id"] for lk in repo.get_links(conn, from_id=r2["id"], project_id=pid)], "verification_suggestion": f"重新验证 {r2['id']} 的时效"})
+            else:
+                fresh.append(r)
+        if stale_facts and not req.include_proposals:
+            results = fresh
+        facts = [{"id": r["id"], "type": r["type"], "status": r["status"], "task_status": r.get("task_status"), "kind": "fact", "provenance": [lk["to_id"] for lk in repo.get_links(conn, from_id=r["id"], project_id=pid)]} for r in results]
 
         evidence_list: list[dict[str, Any]] = []
         if req.include_evidence:
@@ -221,13 +317,23 @@ def brain_ask(req: BrainAskRequest, db_path: str | Path | None = None) -> BrainA
                         if ev:
                             evidence_list.append(ev)
 
+        proposals_out: list[dict[str, Any]] = []
+        if req.include_proposals:
+            props = repo.list_proposals(conn, project_id=pid, status="pending", limit=req.limit)
+            for p in props:
+                if req.as_of_commit and p.get("payload", {}).get("commit_hash") and p["payload"]["commit_hash"] != req.as_of_commit:
+                    continue
+                proposals_out.append({**p, "kind": "proposal", "provenance": p.get("source_event_ids", []), "verification_suggestion": p.get("verification_suggestion")})
+
         if results:
             answer = "；".join(_answer_from_row(r) for r in results[:3])
+        elif proposals_out:
+            answer = f"未找到已确认事实，但有 {len(proposals_out)} 条待审建议。"
         else:
             answer = "未找到相关记录。"
 
         uncertainties: list[str] = []
-        if not results:
+        if not results and not proposals_out:
             uncertainties.append("无匹配记录，建议检查关键词或补充记录。")
             if match_mode == "none":
                 uncertainties.append("检索未命中任何候选，已应用相关度阈值过滤低相关结果。")
@@ -235,14 +341,16 @@ def brain_ask(req: BrainAskRequest, db_path: str | Path | None = None) -> BrainA
             has_unverified = any(r["status"] in ("draft", "proposed", "observed") for r in results)
             if has_unverified:
                 uncertainties.append("部分结果尚未验证，需进一步确认。")
-            if not evidence_list:
+            if not evidence_list and results:
                 uncertainties.append("相关记录缺少可验证证据。")
             low_scores = [m for m in matches if m["score"] < 0.22]
             if low_scores:
                 uncertainties.append(f"{len(low_scores)} 条结果相关度较低，仅作弱命中。")
+            if stale_facts:
+                uncertainties.append(f"{len(stale_facts)} 条记录已过期，已降级为 stale_fact。")
 
         confidence = compute_confidence(results, len(evidence_list))
-        return BrainAskResponse(answer=answer, facts=facts, evidence=evidence_list, uncertainties=uncertainties, confidence=confidence, match_mode=match_mode, matches=matches)
+        return BrainAskResponse(answer=answer, facts=facts, evidence=evidence_list, uncertainties=uncertainties, confidence=confidence, match_mode=match_mode, matches=matches, proposals=proposals_out, stale_facts=stale_facts)
     finally:
         conn.close()
 
@@ -257,6 +365,19 @@ def brain_onboard(req: BrainOnboardRequest, db_path: str | Path | None = None) -
         decisions = repo.list_memories(conn, project_id=pid, mem_type="decision", limit=5)
         experiences = repo.list_memories(conn, project_id=pid, mem_type="experience", limit=5)
         handovers = repo.list_handovers(conn, project_id=pid, limit=1)
+        # project model enrichment (best-effort, never fails onboard)
+        pending_reviews = len(repo.list_proposals(conn, project_id=pid, status="pending", limit=100))
+        snapshots = repo.list_snapshots(conn, project_id=pid, limit=1)
+        basis_commit = snapshots[0].get("basis_commit") if snapshots else None
+        try:
+            from .project_model import build_model
+
+            model, _, _ = build_model(conn, pid)
+            stale_context = model.get("stale", []) if isinstance(model, dict) else []
+            verification_suggestions = [f"验证 {s['id']}: {s['reason']}" for s in stale_context[:5]]
+        except Exception:
+            stale_context = []
+            verification_suggestions = []
 
         blocked_tasks = [t for t in tasks_all if t.get("task_status") == "blocked"]
         in_progress_tasks = [t for t in tasks_all if t.get("task_status") == "in_progress"]
@@ -335,6 +456,20 @@ def brain_onboard(req: BrainOnboardRequest, db_path: str | Path | None = None) -
                 if lk["relation"] == "evidence_of" and lk["to_id"] not in evidence_ids:
                     evidence_ids.append(lk["to_id"])
 
+        # enrich brief with model/suggestions (not truncating them away unless needed)
+        brief["pending_reviews"] = pending_reviews
+        brief["stale_context"] = stale_context[:5] if stale_context else []
+        brief["verification_suggestions"] = verification_suggestions
+        if basis_commit:
+            brief["basis_commit"] = basis_commit
+        try:
+            from .project_model import build_model
+
+            model2, _, _ = build_model(conn, pid)
+            brief["project_model_summary"] = {k: (len(v) if isinstance(v, list) else (1 if v else 0)) for k, v in model2.items() if k != "provenance"}
+        except Exception:
+            pass
+
         all_facts = identities + states + tasks_all + decisions + experiences
         ev_count = len(repo.list_evidence(conn, project_id=pid, limit=100))
         confidence = compute_confidence(all_facts, ev_count)
@@ -342,7 +477,123 @@ def brain_onboard(req: BrainOnboardRequest, db_path: str | Path | None = None) -
         if req.token_budget:
             brief = _truncate_brief(brief, req.token_budget)
 
-        return BrainOnboardResponse(project_id=req.project_id, generated_at=now_iso(), brief=brief, source_ids=source_ids, evidence_ids=evidence_ids, missing_context=missing, confidence=confidence)
+        return BrainOnboardResponse(project_id=req.project_id, generated_at=now_iso(), brief=brief, source_ids=source_ids, evidence_ids=evidence_ids, missing_context=missing, pending_reviews=pending_reviews, stale_context=stale_context[:5], verification_suggestions=verification_suggestions, basis_commit=basis_commit, confidence=confidence)
+    finally:
+        conn.close()
+
+
+def brain_curate(req: BrainCurateRequest, db_path: str | Path | None = None) -> BrainCurateResponse:
+    conn = ensure_db(db_path)
+    mode = req.mode
+    if mode == "model":
+        try:
+            adapter = ModelCuratorAdapter()
+            if not getattr(adapter, "enabled", False):
+                raise RuntimeError("model curator disabled")
+            events = repo.list_events(conn, project_id=req.project_id, limit=50)
+            props = adapter.generate(events, req.project_id)
+            if props:
+                conn.commit()
+                return BrainCurateResponse(created=[p["id"] for p in props], warnings=[])
+            raise RuntimeError("model returned nothing")
+        except Exception as e:
+            warnings = [f"model curator fallback: {e}"]
+            rule = RuleCurator()
+            created, w2 = rule.curate(conn, req.project_id, event_ids=req.event_ids)
+            conn.commit()
+            warnings.extend(w2)
+            return BrainCurateResponse(created=created, warnings=warnings)
+    rule = RuleCurator()
+    created, warnings = rule.curate(conn, req.project_id, event_ids=req.event_ids)
+    conn.commit()
+    return BrainCurateResponse(created=created, warnings=warnings)
+
+
+def brain_review_list(req: BrainReviewListRequest, db_path: str | Path | None = None) -> BrainReviewListResponse:
+    conn = ensure_db(db_path)
+    try:
+        proposals = repo.list_proposals(conn, project_id=req.project_id, status=req.status, limit=req.limit)
+        return BrainReviewListResponse(proposals=proposals)
+    finally:
+        conn.close()
+
+
+def brain_review_apply(req: BrainReviewApplyRequest, db_path: str | Path | None = None) -> BrainReviewApplyResponse:
+    conn = ensure_db(db_path)
+    pid = req.project_id
+    try:
+        prop = repo.get_proposal(conn, req.proposal_id, project_id=pid)
+        if prop is None:
+            raise ValueError(f"proposal {req.proposal_id} not found in {pid}")
+        if prop["project_id"] != pid:
+            raise ValueError("project_id mismatch")
+        if prop["status"] == "approved":
+            raise ValueError(f"proposal {req.proposal_id} already approved")
+        # validate sources still exist
+        for eid in prop.get("source_event_ids", []):
+            found = any(e["id"] == eid for e in repo.list_events(conn, project_id=pid, limit=200))
+            if not found:
+                raise ValueError(f"source event {eid} no longer exists, re-curate required")
+        target_id = prop.get("target_id")
+        if target_id:
+            mem = repo.get_memory(conn, target_id, project_id=pid)
+            if mem and mem.get("updated_at") and prop.get("created_at") and mem["updated_at"] > prop["created_at"]:
+                repo.update_proposal(conn, req.proposal_id, status="superseded", reviewer=req.reviewer, superseded_by=target_id, project_id=pid)
+                ev_id = repo.create_event(conn, project_id=pid, action="review", agent_id=req.reviewer, summary=f"review {req.proposal_id} superseded (target updated)", payload={"proposal_id": req.proposal_id, "action": "superseded"}, source="review", result="superseded")
+                conn.commit()
+                raise ValueError(f"target {target_id} changed after proposal, marked superseded; re-curate")
+        # apply
+        new_status = req.action
+        repo.update_proposal(conn, req.proposal_id, status=new_status, reviewer=req.reviewer, project_id=pid)
+        applied_event_id = None
+        if new_status == "approved":
+            action = prop["action"]
+            payload = prop.get("payload") or {}
+            if action == "create_memory":
+                mtype = payload.get("type", "knowledge")
+                repo.create_memory(conn, mem_type=mtype, content=payload.get("content", {}), status=payload.get("status", "proposed"), tags=payload.get("tags"), created_by=req.reviewer, project_id=pid, origin="rule_curator")
+            elif action == "update_memory" and target_id:
+                repo.update_memory(conn, target_id, content=payload.get("content"), status=payload.get("status"), project_id=pid)
+            elif action == "verify_memory" and target_id:
+                repo.update_memory(conn, target_id, status="verified", project_id=pid)
+            elif action == "invalidate_memory" and target_id:
+                repo.update_memory(conn, target_id, status="invalid", project_id=pid)
+            elif action == "create_link":
+                repo.create_link(conn, payload.get("from_id"), payload.get("relation", "related_to"), payload.get("to_id"), project_id=pid)
+            elif action == "create_task":
+                repo.create_memory(conn, mem_type="task", content=payload.get("content", {}), status="active", task_status="in_progress", created_by=req.reviewer, project_id=pid)
+            applied_event_id = repo.create_event(conn, project_id=pid, action="review", agent_id=req.reviewer, summary=f"review {req.proposal_id} {new_status}", payload={"proposal_id": req.proposal_id, "action": new_status, "reason": req.reason}, source="review", result=new_status)
+        else:
+            applied_event_id = repo.create_event(conn, project_id=pid, action="review", agent_id=req.reviewer, summary=f"review {req.proposal_id} {new_status}", payload={"proposal_id": req.proposal_id, "action": new_status}, source="review", result=new_status)
+        conn.commit()
+        prop2 = repo.get_proposal(conn, req.proposal_id, project_id=pid)
+        return BrainReviewApplyResponse(proposal=prop2 or prop, applied_event_id=applied_event_id)
+    finally:
+        conn.close()
+
+
+def brain_snapshot(req: BrainSnapshotRequest, db_path: str | Path | None = None) -> BrainSnapshotResponse:
+    conn = ensure_db(db_path)
+    try:
+        from .project_model import create_snapshot, build_model
+
+        sid = create_snapshot(conn, req.project_id, basis_commit=req.basis_commit, basis_branch=req.basis_branch)
+        conn.commit()
+        snap = repo.get_snapshot(conn, sid, project_id=req.project_id)
+        assert snap is not None
+        return BrainSnapshotResponse(snapshot_id=snap["id"], model_json=snap["model_json"], source_ids=snap["source_ids"], confidence=snap["confidence"])
+    finally:
+        conn.close()
+
+
+def brain_rebuild_snapshot(snapshot_id: str, project_id: str, db_path: str | Path | None = None) -> BrainSnapshotResponse:
+    conn = ensure_db(db_path)
+    try:
+        from .project_model import rebuild_snapshot
+
+        snap = rebuild_snapshot(conn, snapshot_id, project_id=project_id)
+        conn.commit()
+        return BrainSnapshotResponse(snapshot_id=snap["id"], model_json=snap["model_json"], source_ids=snap["source_ids"], confidence=snap["confidence"])
     finally:
         conn.close()
 
@@ -432,6 +683,39 @@ def brain_handover(req: BrainHandoverRequest, db_path: str | Path | None = None)
         for eid in req.evidence_ids:
             repo.create_link(conn, handover_id, "evidence_of", eid, project_id=pid)
 
+        # enrich handover with session events / pending / suggestions / basis
+        session_event_ids = [e["id"] for e in repo.list_events(conn, project_id=pid, limit=100) if e.get("session_id") == req.session_id] if req.session_id else []
+        pending_count = len(repo.list_proposals(conn, project_id=pid, status="pending", limit=100))
+        verification_suggestions: list[str] = []
+        try:
+            from .project_model import build_model
+
+            m, _, _ = build_model(conn, pid)
+            for s in (m.get("stale", [])[:3] if isinstance(m, dict) else []):
+                verification_suggestions.append(f"验证 {s['id']}: {s['reason']}")
+        except Exception:
+            pass
+        basis_commit = None
+        try:
+            import subprocess
+
+            basis_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, timeout=3).strip()
+        except Exception:
+            pass
+        model_snapshot_id = None
+        try:
+            from .project_model import create_snapshot
+
+            model_snapshot_id = create_snapshot(conn, pid, basis_commit=basis_commit)
+        except Exception:
+            pass
+        # write back to report for provenance
+        report["session_event_ids"] = session_event_ids
+        report["pending_proposals_count"] = pending_count
+        report["verification_suggestions"] = verification_suggestions
+        report["basis_commit"] = basis_commit
+        report["model_snapshot_id"] = model_snapshot_id
+
         conn.commit()
 
         if db_path:
@@ -442,7 +726,7 @@ def brain_handover(req: BrainHandoverRequest, db_path: str | Path | None = None)
         md = _handover_markdown(handover_id, report)
         (exports_dir / "latest-handover.md").write_text(md, encoding="utf-8")
 
-        return BrainHandoverResponse(handover_id=handover_id, report=report, brain_updates=brain_updates)
+        return BrainHandoverResponse(handover_id=handover_id, report=report, brain_updates=brain_updates, pending_proposals_count=pending_count, verification_suggestions=verification_suggestions, basis_commit=basis_commit, model_snapshot_id=model_snapshot_id)
     finally:
         conn.close()
 

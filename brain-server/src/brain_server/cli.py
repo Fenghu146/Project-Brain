@@ -90,7 +90,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
         print("error: --project is required", file=sys.stderr)
         return 2
     scope = [s.strip() for s in args.scope.split(",") if s.strip()] if args.scope else None
-    req = BrainAskRequest(project_id=project_id, agent_id=args.agent, session_id=args.session, question=args.question, scope=scope, include_evidence=not args.no_evidence, limit=args.limit)
+    req = BrainAskRequest(project_id=project_id, agent_id=args.agent, session_id=args.session, question=args.question, scope=scope, include_evidence=not args.no_evidence, limit=args.limit, include_proposals=bool(getattr(args, "include_proposals", False)), as_of_commit=getattr(args, "as_of_commit", None), as_of_time=getattr(args, "as_of_time", None))
     resp = brain_ask(req, db_path=str(db_path))
     print(json.dumps(resp.model_dump(), ensure_ascii=False, indent=2))
     return 0
@@ -122,10 +122,107 @@ def cmd_record(args: argparse.Namespace) -> int:
         tags = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else None
         evidence = json.loads(args.evidence) if args.evidence else None
         evidence_ids = [s.strip() for s in args.evidence_ids.split(",") if s.strip()] if getattr(args, "evidence_ids", None) else None
-        records.append(RecordInput(type=args.type, content=content, status=args.status, task_status=getattr(args, "task_status", None), confidence=args.confidence, tags=tags, evidence=evidence, evidence_ids=evidence_ids))
+        records.append(RecordInput(type=args.type, content=content, status=args.status, task_status=getattr(args, "task_status", None), confidence=args.confidence, tags=tags, evidence=evidence, evidence_ids=evidence_ids, origin=getattr(args, "origin", None), valid_from=getattr(args, "valid_from", None), valid_until=getattr(args, "valid_until", None), branch=getattr(args, "branch", None), commit_hash=getattr(args, "commit_hash", None), verification_due_at=getattr(args, "verification_due_at", None)))
 
     req = BrainRecordRequest(project_id=project_id, agent_id=args.agent, session_id=args.session, records=records)
     resp = brain_record(req, db_path=str(db_path))
+    print(json.dumps(resp.model_dump(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_ingest(args: argparse.Namespace) -> int:
+    from .protocol import brain_ingest
+    from .models import IngestRequest
+
+    db_path = resolve_db(args.db)
+    project_id = resolve_project_id(db_path, args.project)
+    if not project_id:
+        print("error: --project is required", file=sys.stderr)
+        return 2
+    if getattr(args, "dry_run", False):
+        print(json.dumps({"dry_run": True, "source": args.source, "payload": {"command": getattr(args, "command", None), "log_path": getattr(args, "log_path", None), "path": getattr(args, "path", None)}}, ensure_ascii=False, indent=2))
+        return 0
+    req = IngestRequest(project_id=project_id, source=args.source, agent_id=getattr(args, "agent", "system"), session_id=getattr(args, "session", None), payload={"command": getattr(args, "command", None), "log_path": getattr(args, "log_path", None), "path": getattr(args, "path", None), "cwd": getattr(args, "cwd", None)})
+    resp = brain_ingest(req, db_path=str(db_path))
+    print(json.dumps(resp, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_curate(args: argparse.Namespace) -> int:
+    from .protocol import brain_curate
+    from .models import BrainCurateRequest
+
+    db_path = resolve_db(args.db)
+    project_id = resolve_project_id(db_path, args.project)
+    if not project_id:
+        print("error: --project is required", file=sys.stderr)
+        return 2
+    event_ids = [s.strip() for s in args.event_ids.split(",") if s.strip()] if getattr(args, "event_ids", None) else None
+    req = BrainCurateRequest(project_id=project_id, agent_id=getattr(args, "agent", None), session_id=getattr(args, "session", None), event_ids=event_ids, mode=getattr(args, "mode", "rule"))
+    resp = brain_curate(req, db_path=str(db_path))
+    print(json.dumps(resp.model_dump(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_review_list(args: argparse.Namespace) -> int:
+    from .protocol import brain_review_list
+    from .models import BrainReviewListRequest
+
+    db_path = resolve_db(args.db)
+    project_id = resolve_project_id(db_path, args.project)
+    if not project_id:
+        print("error: --project is required", file=sys.stderr)
+        return 2
+    req = BrainReviewListRequest(project_id=project_id, status=getattr(args, "status", None), limit=getattr(args, "limit", 20))
+    resp = brain_review_list(req, db_path=str(db_path))
+    print(json.dumps(resp.model_dump(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_review_apply(args: argparse.Namespace) -> int:
+    from .protocol import brain_review_apply
+    from .models import BrainReviewApplyRequest
+
+    db_path = resolve_db(args.db)
+    project_id = resolve_project_id(db_path, args.project)
+    if not project_id:
+        print("error: --project is required", file=sys.stderr)
+        return 2
+    actions = [a.strip() for a in args.action.split(",")] if "," in args.action else [args.action]
+    pids = [p.strip() for p in args.proposal_id.split(",") if p.strip()]
+    if len(actions) == 1 and len(pids) > 1:
+        actions = actions * len(pids)
+    if len(actions) != len(pids):
+        print("error: --action count must match --proposal-id count", file=sys.stderr)
+        return 2
+    last = None
+    for pid, act in zip(pids, actions):
+        req = BrainReviewApplyRequest(project_id=project_id, proposal_id=pid, action=act, reviewer=args.reviewer, reason=getattr(args, "reason", None))  # type: ignore[arg-type]
+        try:
+            resp = brain_review_apply(req, db_path=str(db_path))
+            print(json.dumps(resp.model_dump(), ensure_ascii=False, indent=2))
+            last = resp
+        except Exception as e:
+            print(json.dumps({"proposal_id": pid, "error": str(e)}, ensure_ascii=False))
+            return 1
+    return 0
+
+
+def cmd_snapshot(args: argparse.Namespace) -> int:
+    from .protocol import brain_snapshot, brain_rebuild_snapshot
+    from .models import BrainSnapshotRequest
+
+    db_path = resolve_db(args.db)
+    project_id = resolve_project_id(db_path, args.project)
+    if not project_id:
+        print("error: --project is required", file=sys.stderr)
+        return 2
+    if getattr(args, "rebuild", None):
+        resp = brain_rebuild_snapshot(args.rebuild, project_id, db_path=str(db_path))
+        print(json.dumps(resp.model_dump(), ensure_ascii=False, indent=2))
+        return 0
+    req = BrainSnapshotRequest(project_id=project_id, basis_commit=getattr(args, "commit", None), basis_branch=getattr(args, "branch", None))
+    resp = brain_snapshot(req, db_path=str(db_path))
     print(json.dumps(resp.model_dump(), ensure_ascii=False, indent=2))
     return 0
 
@@ -345,6 +442,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--scope", help="comma-separated scope filter, e.g. 'uart,dma'")
     s.add_argument("--limit", type=int, default=8)
     s.add_argument("--no-evidence", action="store_true")
+    s.add_argument("--include-proposals", action="store_true")
+    s.add_argument("--as-of-commit", help="filter by commit_hash")
+    s.add_argument("--as-of-time", help="ISO time for valid window")
     s.set_defaults(func=cmd_ask)
 
     s = sub.add_parser("record", help="record knowledge/experience/decision/task/evidence/event")
@@ -359,8 +459,63 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--evidence", help="JSON array of evidence objects")
     s.add_argument("--evidence-ids", help="comma-separated evidence ids to link")
     s.add_argument("--confidence", type=float, help="confidence 0-1")
+    s.add_argument("--origin", help="origin: user/agent/rule_curator/model_curator/importer")
+    s.add_argument("--valid-from", help="ISO time")
+    s.add_argument("--valid-until", help="ISO time")
+    s.add_argument("--branch", help="branch name")
+    s.add_argument("--commit-hash", help="commit hash")
+    s.add_argument("--verification-due-at", help="ISO time")
     s.add_argument("--file", help="JSON file containing records array")
     s.set_defaults(func=cmd_record)
+
+    s = sub.add_parser("ingest", help="ingest git/test/file event")
+    s.add_argument("--project", help="project_id")
+    s.add_argument("--source", required=True, choices=["git", "test", "file", "handover", "record"])
+    s.add_argument("--agent", default="system")
+    s.add_argument("--session", help="session_id")
+    s.add_argument("--command", help="test command for source=test")
+    s.add_argument("--log-path", help="log path for test evidence")
+    s.add_argument("--path", help="file path for source=file")
+    s.add_argument("--cwd", help="working dir for collectors")
+    s.add_argument("--dry-run", action="store_true")
+    s.set_defaults(func=cmd_ingest)
+
+    s = sub.add_parser("curate", help="run curator to generate proposals")
+    s.add_argument("--project", help="project_id")
+    s.add_argument("--agent", help="agent_id")
+    s.add_argument("--session", help="session_id")
+    s.add_argument("--event-ids", help="comma-separated event ids (default: recent)")
+    s.add_argument("--mode", default="rule", choices=["rule", "model", "auto"])
+    s.set_defaults(func=cmd_curate)
+
+    s = sub.add_parser("review", help="list or apply proposals")
+    s.add_argument("--project", help="project_id")
+    s.add_argument("--status", help="pending/approved/rejected/deferred/superseded")
+    s.add_argument("--limit", type=int, default=20)
+    s.add_argument("--proposal-id", help="proposal id(s) for apply, comma-separated")
+    s.add_argument("--action", help="approved/rejected/deferred/superseded")
+    s.add_argument("--reviewer", help="reviewer id")
+    s.add_argument("--reason", help="reason")
+    s.set_defaults(func=cmd_review_list)
+    s = sub.add_parser("review-list", help="list proposals")
+    s.add_argument("--project", help="project_id")
+    s.add_argument("--status", help="pending/approved/rejected/deferred/superseded")
+    s.add_argument("--limit", type=int, default=20)
+    s.set_defaults(func=cmd_review_list)
+    s = sub.add_parser("review-apply", help="approve/reject/defer proposal(s)")
+    s.add_argument("--project", help="project_id")
+    s.add_argument("--proposal-id", required=True, help="proposal id(s), comma-separated")
+    s.add_argument("--action", required=True, help="approved/rejected/deferred/superseded")
+    s.add_argument("--reviewer", required=True)
+    s.add_argument("--reason", help="reason")
+    s.set_defaults(func=cmd_review_apply)
+
+    s = sub.add_parser("snapshot", help="create or rebuild model snapshot")
+    s.add_argument("--project", help="project_id")
+    s.add_argument("--commit", help="basis commit")
+    s.add_argument("--branch", help="basis branch")
+    s.add_argument("--rebuild", help="snapshot id to rebuild")
+    s.set_defaults(func=cmd_snapshot)
 
     s = sub.add_parser("verify", help="verify or invalidate a memory")
     s.add_argument("--project", help="project_id")

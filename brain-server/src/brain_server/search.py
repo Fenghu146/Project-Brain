@@ -101,10 +101,22 @@ def ranked_search(
     limit: int = 8,
     project_id: str | None = None,
     provider: SearchProvider | None = None,
+    as_of_commit: str | None = None,
+    as_of_time: str | None = None,
 ) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
     p = provider or DEFAULT_PROVIDER
     pid = project_id or "default"
+    # as_of_commit filtering: only keep memories with matching commit_hash if provided
+    orig_search = p.search
+    if as_of_commit:
+        def _wrapped(conn2, pid2, query2, scope2, limit2):
+            res = orig_search(conn2, pid2, query2, scope2, limit2)
+            return [r for r in res if r["row"].get("commit_hash") in (None, as_of_commit) or r["row"].get("commit_hash") == as_of_commit]
+        p.search = _wrapped  # type: ignore[assignment]
     scored = p.search(conn, pid, query, scope, limit)
+    # restore if wrapped
+    if as_of_commit:
+        p.search = orig_search  # type: ignore[assignment]
     if not scored:
         fts_any = repo.fts_search(conn, query, limit=1, project_id=pid if project_id else None)
         mode = "none" if not fts_any else "like_fallback"
@@ -116,7 +128,13 @@ def ranked_search(
         mode = "fts"
     rows = [s["row"] for s in scored]
     matches = [{"id": s["row"]["id"], "score": s["score"], "matched_terms": s["matched_terms"], "match_mode": s["match_mode"]} for s in scored]
+    # Embedding provider is optional: if provider is EmbeddingProvider and returns low/跨项目, it already went through same threshold
     return mode, rows, matches
+
+
+class EmbeddingProvider:
+    def search(self, conn: sqlite3.Connection, project_id: str, query: str, scope: list[str] | None, limit: int) -> list[dict[str, Any]]:
+        raise RuntimeError("embedding provider not configured")
 
 
 def compute_confidence(facts: list[dict[str, Any]], evidence_count: int) -> float | None:

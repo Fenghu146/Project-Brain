@@ -55,6 +55,12 @@ def create_memory(
     created_by: str = "system",
     mem_id: str | None = None,
     project_id: str = "default",
+    valid_from: str | None = None,
+    valid_until: str | None = None,
+    branch: str | None = None,
+    commit_hash: str | None = None,
+    verification_due_at: str | None = None,
+    origin: str = "user",
 ) -> str:
     if mem_id is None:
         mem_id = next_memory_id(conn, mem_type, project_id=project_id)
@@ -62,8 +68,8 @@ def create_memory(
     content_json = json.dumps(content, ensure_ascii=False) if not isinstance(content, str) else json.dumps({"text": content}, ensure_ascii=False)
     tags_json = json.dumps(tags or [], ensure_ascii=False)
     conn.execute(
-        "INSERT INTO memories (id, project_id, type, status, task_status, content_json, confidence, tags, created_by, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (mem_id, project_id, mem_type, status, task_status, content_json, confidence, tags_json, created_by, ts, ts),
+        "INSERT INTO memories (id, project_id, type, status, task_status, content_json, confidence, tags, created_by, created_at, updated_at, valid_from, valid_until, branch, commit_hash, verification_due_at, origin) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (mem_id, project_id, mem_type, status, task_status, content_json, confidence, tags_json, created_by, ts, ts, valid_from, valid_until, branch, commit_hash, verification_due_at, origin),
     )
     fts_text = _fts_text(mem_type, content, tags)
     conn.execute("INSERT INTO memory_fts (id, type, text) VALUES (?,?,?)", (mem_id, mem_type, fts_text))
@@ -164,6 +170,13 @@ def _row_to_memory(row: sqlite3.Row) -> dict[str, Any]:
         "created_by": row["created_by"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+        "valid_from": row["valid_from"] if "valid_from" in row.keys() else None,
+        "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
+        "branch": row["branch"] if "branch" in row.keys() else None,
+        "commit_hash": row["commit_hash"] if "commit_hash" in row.keys() else None,
+        "verification_due_at": row["verification_due_at"] if "verification_due_at" in row.keys() else None,
+        "origin": row["origin"] if "origin" in row.keys() else "user",
+        "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None,
     }
 
 
@@ -237,6 +250,140 @@ def create_link(conn: sqlite3.Connection, from_id: str, relation: str, to_id: st
     conn.execute("INSERT OR IGNORE INTO links (from_id, project_id, relation, to_id) VALUES (?,?,?,?)", (from_id, project_id, relation, to_id))
 
 
+PROPOSAL_PREFIX = "P"
+SNAPSHOT_PREFIX = "MS"
+
+
+def create_proposal(
+    conn: sqlite3.Connection,
+    project_id: str,
+    action: str,
+    reason: str,
+    source_event_ids: list[str],
+    payload: dict[str, Any] | None = None,
+    target_type: str | None = None,
+    target_id: str | None = None,
+    source_evidence_ids: list[str] | None = None,
+    affected_ids: list[str] | None = None,
+    risk: str | None = None,
+    verification_suggestion: str | None = None,
+    confidence: float | None = None,
+    curator_version: str = "rule-v1",
+    origin: str = "rule_curator",
+    proposal_id: str | None = None,
+) -> str:
+    if proposal_id is None:
+        proposal_id = next_id(conn, PROPOSAL_PREFIX, "proposals")
+    ts = now_iso()
+    conn.execute(
+        "INSERT INTO proposals (id, project_id, action, target_type, target_id, payload_json, reason, source_event_ids, source_evidence_ids, affected_ids, risk, verification_suggestion, confidence, curator_version, origin, status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (proposal_id, project_id, action, target_type, target_id, json.dumps(payload or {}, ensure_ascii=False), reason, json.dumps(source_event_ids, ensure_ascii=False), json.dumps(source_evidence_ids or [], ensure_ascii=False), json.dumps(affected_ids or [], ensure_ascii=False), risk, verification_suggestion, confidence, curator_version, origin, "pending", ts),
+    )
+    return proposal_id
+
+
+def get_proposal(conn: sqlite3.Connection, proposal_id: str, project_id: str | None = None) -> dict[str, Any] | None:
+    q = "SELECT * FROM proposals WHERE id=?"
+    params: list[Any] = [proposal_id]
+    if project_id:
+        q += " AND project_id=?"
+        params.append(project_id)
+    cur = conn.execute(q, params)
+    row = cur.fetchone()
+    if row is None:
+        return None
+    return _row_to_proposal(row)
+
+
+def _row_to_proposal(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "project_id": row["project_id"],
+        "action": row["action"],
+        "target_type": row["target_type"],
+        "target_id": row["target_id"],
+        "payload": json.loads(row["payload_json"]) if row["payload_json"] else {},
+        "reason": row["reason"],
+        "source_event_ids": json.loads(row["source_event_ids"]) if row["source_event_ids"] else [],
+        "source_evidence_ids": json.loads(row["source_evidence_ids"]) if row["source_evidence_ids"] else [],
+        "affected_ids": json.loads(row["affected_ids"]) if row["affected_ids"] else [],
+        "risk": row["risk"],
+        "verification_suggestion": row["verification_suggestion"],
+        "confidence": row["confidence"],
+        "curator_version": row["curator_version"],
+        "origin": row["origin"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "reviewed_at": row["reviewed_at"],
+        "reviewer": row["reviewer"],
+        "superseded_by": row["superseded_by"],
+    }
+
+
+def list_proposals(conn: sqlite3.Connection, project_id: str | None = None, status: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    q = "SELECT * FROM proposals WHERE 1=1"
+    params: list[Any] = []
+    if project_id:
+        q += " AND project_id=?"
+        params.append(project_id)
+    if status:
+        q += " AND status=?"
+        params.append(status)
+    q += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    cur = conn.execute(q, params)
+    return [_row_to_proposal(r) for r in cur.fetchall()]
+
+
+def update_proposal(conn: sqlite3.Connection, proposal_id: str, status: str, reviewer: str | None = None, reason: str | None = None, superseded_by: str | None = None, project_id: str | None = None) -> None:
+    q = "SELECT * FROM proposals WHERE id=?"
+    params: list[Any] = [proposal_id]
+    if project_id:
+        q += " AND project_id=?"
+        params.append(project_id)
+    cur = conn.execute(q, params)
+    row = cur.fetchone()
+    if row is None:
+        raise KeyError(f"proposal not found: {proposal_id}")
+    if row["status"] == "approved":
+        raise ValueError(f"proposal {proposal_id} already approved, cannot re-apply")
+    ts = now_iso()
+    conn.execute("UPDATE proposals SET status=?, reviewed_at=?, reviewer=?, superseded_by=? WHERE id=?", (status, ts, reviewer, superseded_by, proposal_id))
+
+
+def create_snapshot(conn: sqlite3.Connection, project_id: str, model_json: dict[str, Any], source_ids: list[str], basis_commit: str | None = None, basis_branch: str | None = None, confidence: float | None = None, curator_version: str = "rule-v1", snapshot_id: str | None = None) -> str:
+    if snapshot_id is None:
+        snapshot_id = next_id(conn, SNAPSHOT_PREFIX, "model_snapshots")
+    ts = now_iso()
+    conn.execute("INSERT INTO model_snapshots (id, project_id, basis_commit, basis_branch, generated_at, model_json, source_ids, confidence, curator_version) VALUES (?,?,?,?,?,?,?,?,?)", (snapshot_id, project_id, basis_commit, basis_branch, ts, json.dumps(model_json, ensure_ascii=False), json.dumps(source_ids, ensure_ascii=False), confidence, curator_version))
+    return snapshot_id
+
+
+def get_snapshot(conn: sqlite3.Connection, snapshot_id: str, project_id: str | None = None) -> dict[str, Any] | None:
+    q = "SELECT * FROM model_snapshots WHERE id=?"
+    params: list[Any] = [snapshot_id]
+    if project_id:
+        q += " AND project_id=?"
+        params.append(project_id)
+    cur = conn.execute(q, params)
+    row = cur.fetchone()
+    if row is None:
+        return None
+    return {"id": row["id"], "project_id": row["project_id"], "basis_commit": row["basis_commit"], "basis_branch": row["basis_branch"], "generated_at": row["generated_at"], "model_json": json.loads(row["model_json"]), "source_ids": json.loads(row["source_ids"]), "confidence": row["confidence"], "curator_version": row["curator_version"]}
+
+
+def list_snapshots(conn: sqlite3.Connection, project_id: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
+    q = "SELECT * FROM model_snapshots WHERE 1=1"
+    params: list[Any] = []
+    if project_id:
+        q += " AND project_id=?"
+        params.append(project_id)
+    q += " ORDER BY generated_at DESC LIMIT ?"
+    params.append(limit)
+    cur = conn.execute(q, params)
+    return [{"id": r["id"], "project_id": r["project_id"], "basis_commit": r["basis_commit"], "basis_branch": r["basis_branch"], "generated_at": r["generated_at"], "model_json": json.loads(r["model_json"]), "source_ids": json.loads(r["source_ids"]), "confidence": r["confidence"], "curator_version": r["curator_version"]} for r in cur.fetchall()]
+
+
 def get_links(conn: sqlite3.Connection, from_id: str | None = None, to_id: str | None = None, project_id: str | None = None) -> list[dict[str, Any]]:
     q = "SELECT * FROM links WHERE 1=1"
     params: list[Any] = []
@@ -263,13 +410,21 @@ def create_event(
     payload: dict[str, Any] | None = None,
     ev_id: str | None = None,
     project_id: str = "default",
+    dedup_key: str | None = None,
+    source: str | None = None,
+    result: str | None = None,
 ) -> str:
+    if dedup_key:
+        cur = conn.execute("SELECT id FROM events WHERE project_id=? AND dedup_key=? LIMIT 1", (project_id, dedup_key))
+        row = cur.fetchone()
+        if row:
+            return row["id"]
     if ev_id is None:
         ev_id = next_id(conn, EVENT_PREFIX, "events", project_id=project_id)
     ts = now_iso()
     conn.execute(
-        "INSERT INTO events (id, project_id, action, agent_id, session_id, target, summary, payload_json, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-        (ev_id, project_id, action, agent_id, session_id, target, summary, json.dumps(payload or {}, ensure_ascii=False), ts),
+        "INSERT INTO events (id, project_id, action, agent_id, session_id, target, summary, payload_json, created_at, dedup_key, source, result) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (ev_id, project_id, action, agent_id, session_id, target, summary, json.dumps(payload or {}, ensure_ascii=False), ts, dedup_key, source, result),
     )
     return ev_id
 
@@ -293,6 +448,9 @@ def list_events(conn: sqlite3.Connection, project_id: str | None = None, limit: 
             "target": r["target"],
             "summary": r["summary"],
             "payload": json.loads(r["payload_json"]) if r["payload_json"] else {},
+            "dedup_key": r["dedup_key"] if "dedup_key" in r.keys() else None,
+            "source": r["source"] if "source" in r.keys() else None,
+            "result": r["result"] if "result" in r.keys() else None,
             "created_at": r["created_at"],
         }
         for r in cur.fetchall()

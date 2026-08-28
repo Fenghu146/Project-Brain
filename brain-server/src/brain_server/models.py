@@ -45,6 +45,12 @@ class RecordInput(BaseModel):
     tags: list[str] | None = None
     evidence: list[dict[str, Any]] | None = None
     evidence_ids: list[str] | None = None
+    origin: str | None = None
+    valid_from: str | None = None
+    valid_until: str | None = None
+    branch: str | None = None
+    commit_hash: str | None = None
+    verification_due_at: str | None = None
 
 
 class BrainRecordRequest(BaseModel):
@@ -72,6 +78,9 @@ class BrainAskRequest(BaseModel):
     scope: list[str] | None = None
     include_evidence: bool = True
     limit: int = 8
+    include_proposals: bool = False
+    as_of_commit: str | None = None
+    as_of_time: str | None = None
 
 
 class BrainAskResponse(BaseModel):
@@ -82,6 +91,8 @@ class BrainAskResponse(BaseModel):
     confidence: float | None = None
     match_mode: str = "none"
     matches: list[dict[str, Any]] = Field(default_factory=list)
+    proposals: list[dict[str, Any]] = Field(default_factory=list)
+    stale_facts: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class BrainOnboardRequest(BaseModel):
@@ -99,6 +110,10 @@ class BrainOnboardResponse(BaseModel):
     source_ids: list[str] = Field(default_factory=list)
     evidence_ids: list[str] = Field(default_factory=list)
     missing_context: list[str] = Field(default_factory=list)
+    pending_reviews: int = 0
+    stale_context: list[dict[str, Any]] = Field(default_factory=list)
+    verification_suggestions: list[str] = Field(default_factory=list)
+    basis_commit: str | None = None
     confidence: float | None = None
 
 
@@ -120,6 +135,75 @@ class BrainHandoverResponse(BaseModel):
     handover_id: str
     report: dict[str, Any]
     brain_updates: list[str] = Field(default_factory=list)
+    pending_proposals_count: int = 0
+    verification_suggestions: list[str] = Field(default_factory=list)
+    basis_commit: str | None = None
+    model_snapshot_id: str | None = None
+
+
+class ProposalAction(str):
+    pass
+
+
+ProposalStatus = Literal["pending", "approved", "rejected", "deferred", "superseded"]
+ReviewAction = Literal["approved", "rejected", "deferred", "superseded"]
+
+
+class BrainCurateRequest(BaseModel):
+    project_id: str
+    agent_id: str | None = None
+    session_id: str | None = None
+    event_ids: list[str] | None = None
+    mode: str = "rule"
+
+
+class BrainCurateResponse(BaseModel):
+    created: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class BrainReviewListRequest(BaseModel):
+    project_id: str
+    status: str | None = None
+    limit: int = 20
+
+
+class BrainReviewListResponse(BaseModel):
+    proposals: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class BrainReviewApplyRequest(BaseModel):
+    project_id: str
+    proposal_id: str
+    action: ReviewAction
+    reviewer: str
+    reason: str | None = None
+
+
+class BrainReviewApplyResponse(BaseModel):
+    proposal: dict[str, Any]
+    applied_event_id: str | None = None
+
+
+class BrainSnapshotRequest(BaseModel):
+    project_id: str
+    basis_commit: str | None = None
+    basis_branch: str | None = None
+
+
+class BrainSnapshotResponse(BaseModel):
+    snapshot_id: str
+    model_json: dict[str, Any]
+    source_ids: list[str] = Field(default_factory=list)
+    confidence: float | None = None
+
+
+class IngestRequest(BaseModel):
+    project_id: str
+    source: str
+    agent_id: str = "system"
+    session_id: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
 
 
 def content_to_text(content: dict[str, Any] | str) -> str:

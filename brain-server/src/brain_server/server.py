@@ -14,7 +14,7 @@ except ImportError:
     mcp = _Srv("project-brain")
     _is_v2 = False
 
-from .models import BrainAskRequest, BrainHandoverRequest, BrainOnboardRequest, BrainRecordRequest, RecordInput
+from .models import BrainAskRequest, BrainCurateRequest, BrainHandoverRequest, BrainOnboardRequest, BrainRecordRequest, BrainReviewApplyRequest, BrainReviewListRequest, BrainSnapshotRequest, IngestRequest, RecordInput
 from .db import get_connection
 from .repository import create_link, get_links, list_evidence, get_memory, update_memory
 
@@ -29,10 +29,10 @@ def brain_onboard(project_id: str, agent_id: str, session_id: str | None = None,
 
 
 @mcp.tool()
-def brain_ask(project_id: str, agent_id: str, question: str, session_id: str | None = None, scope: list[str] | None = None, include_evidence: bool = True, limit: int = 8) -> dict[str, Any]:
+def brain_ask(project_id: str, agent_id: str, question: str, session_id: str | None = None, scope: list[str] | None = None, include_evidence: bool = True, limit: int = 8, include_proposals: bool = False, as_of_commit: str | None = None, as_of_time: str | None = None) -> dict[str, Any]:
     from .protocol import brain_ask as _ask
 
-    req = BrainAskRequest(project_id=project_id, agent_id=agent_id, session_id=session_id, question=question, scope=scope, include_evidence=include_evidence, limit=limit)
+    req = BrainAskRequest(project_id=project_id, agent_id=agent_id, session_id=session_id, question=question, scope=scope, include_evidence=include_evidence, limit=limit, include_proposals=include_proposals, as_of_commit=as_of_commit, as_of_time=as_of_time)
     resp = _ask(req)
     return resp.model_dump()
 
@@ -146,6 +146,53 @@ def brain_export(project_id: str | None = None, what: str = "all") -> dict[str, 
         return out
     finally:
         conn.close()
+
+
+@mcp.tool()
+def brain_ingest(project_id: str, source: str, agent_id: str = "system", session_id: str | None = None, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    from .protocol import brain_ingest as _ingest
+
+    req = IngestRequest(project_id=project_id, source=source, agent_id=agent_id, session_id=session_id, payload=payload or {})
+    return _ingest(req)
+
+
+@mcp.tool()
+def brain_curate(project_id: str, event_ids: list[str] | None = None, mode: str = "rule", agent_id: str | None = None, session_id: str | None = None) -> dict[str, Any]:
+    from .protocol import brain_curate as _curate
+
+    req = BrainCurateRequest(project_id=project_id, event_ids=event_ids, mode=mode, agent_id=agent_id, session_id=session_id)
+    return _curate(req).model_dump()
+
+
+@mcp.tool()
+def brain_review_list(project_id: str, status: str | None = None, limit: int = 20) -> dict[str, Any]:
+    from .protocol import brain_review_list as _list
+
+    req = BrainReviewListRequest(project_id=project_id, status=status, limit=limit)
+    return _list(req).model_dump()
+
+
+@mcp.tool()
+def brain_review_apply(project_id: str, proposal_id: str, action: str, reviewer: str, reason: str | None = None) -> dict[str, Any]:
+    from .protocol import brain_review_apply as _apply
+
+    req = BrainReviewApplyRequest(project_id=project_id, proposal_id=proposal_id, action=action, reviewer=reviewer, reason=reason)  # type: ignore[arg-type]
+    return _apply(req).model_dump()
+
+
+@mcp.tool()
+def brain_snapshot(project_id: str, basis_commit: str | None = None, basis_branch: str | None = None) -> dict[str, Any]:
+    from .protocol import brain_snapshot as _snap
+
+    req = BrainSnapshotRequest(project_id=project_id, basis_commit=basis_commit, basis_branch=basis_branch)
+    return _snap(req).model_dump()
+
+
+@mcp.tool()
+def brain_rebuild_snapshot(project_id: str, snapshot_id: str) -> dict[str, Any]:
+    from .protocol import brain_rebuild_snapshot as _rebuild
+
+    return _rebuild(snapshot_id, project_id).model_dump()
 
 
 def main() -> None:

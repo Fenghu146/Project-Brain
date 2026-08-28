@@ -20,7 +20,14 @@ CREATE TABLE IF NOT EXISTS memories (
   tags TEXT,
   created_by TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  valid_from TEXT,
+  valid_until TEXT,
+  branch TEXT,
+  commit_hash TEXT,
+  verification_due_at TEXT,
+  origin TEXT DEFAULT 'user',
+  superseded_by TEXT
 );
 
 CREATE TABLE IF NOT EXISTS evidence (
@@ -31,7 +38,9 @@ CREATE TABLE IF NOT EXISTS evidence (
   description TEXT,
   metadata_json TEXT,
   status TEXT NOT NULL DEFAULT 'observed',
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  commit_hash TEXT,
+  branch TEXT
 );
 
 CREATE TABLE IF NOT EXISTS links (
@@ -51,7 +60,10 @@ CREATE TABLE IF NOT EXISTS events (
   target TEXT,
   summary TEXT,
   payload_json TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  dedup_key TEXT,
+  source TEXT,
+  result TEXT
 );
 
 CREATE TABLE IF NOT EXISTS handovers (
@@ -88,8 +100,49 @@ CREATE INDEX IF NOT EXISTS idx_handovers_project_created
   ON handovers(project_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_links_project
   ON links(project_id);
+CREATE TABLE IF NOT EXISTS proposals (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  target_type TEXT,
+  target_id TEXT,
+  payload_json TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  source_event_ids TEXT NOT NULL,
+  source_evidence_ids TEXT,
+  affected_ids TEXT,
+  risk TEXT,
+  verification_suggestion TEXT,
+  confidence REAL,
+  curator_version TEXT NOT NULL,
+  origin TEXT NOT NULL DEFAULT 'rule_curator',
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at TEXT NOT NULL,
+  reviewed_at TEXT,
+  reviewer TEXT,
+  superseded_by TEXT
+);
+
+CREATE TABLE IF NOT EXISTS model_snapshots (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  basis_commit TEXT,
+  basis_branch TEXT,
+  generated_at TEXT NOT NULL,
+  model_json TEXT NOT NULL,
+  source_ids TEXT NOT NULL,
+  confidence REAL,
+  curator_version TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_agent_session
   ON events(agent_id, session_id);
+CREATE INDEX IF NOT EXISTS idx_proposals_project_status
+  ON proposals(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_snapshots_project_time
+  ON model_snapshots(project_id, generated_at);
+CREATE INDEX IF NOT EXISTS idx_events_dedup
+  ON events(project_id, dedup_key);
 """
 
 
@@ -120,19 +173,46 @@ def migrate(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "handovers", "project_id", "project_id TEXT NOT NULL DEFAULT 'default'")
     _ensure_column(conn, "links", "project_id", "project_id TEXT NOT NULL DEFAULT 'default'")
     _ensure_column(conn, "memories", "task_status", "task_status TEXT")
+    for col, ddl in [
+        ("valid_from", "valid_from TEXT"),
+        ("valid_until", "valid_until TEXT"),
+        ("branch", "branch TEXT"),
+        ("commit_hash", "commit_hash TEXT"),
+        ("verification_due_at", "verification_due_at TEXT"),
+        ("origin", "origin TEXT DEFAULT 'user'"),
+        ("superseded_by", "superseded_by TEXT"),
+    ]:
+        _ensure_column(conn, "memories", col, ddl)
+    for col, ddl in [
+        ("dedup_key", "dedup_key TEXT"),
+        ("source", "source TEXT"),
+        ("result", "result TEXT"),
+    ]:
+        _ensure_column(conn, "events", col, ddl)
+    for col, ddl in [("commit_hash", "commit_hash TEXT"), ("branch", "branch TEXT")]:
+        _ensure_column(conn, "evidence", col, ddl)
     conn.execute("CREATE TABLE IF NOT EXISTS schema_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS proposals (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, action TEXT NOT NULL, target_type TEXT, target_id TEXT, payload_json TEXT NOT NULL, reason TEXT NOT NULL, source_event_ids TEXT NOT NULL, source_evidence_ids TEXT, affected_ids TEXT, risk TEXT, verification_suggestion TEXT, confidence REAL, curator_version TEXT NOT NULL, origin TEXT NOT NULL DEFAULT 'rule_curator', status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, reviewed_at TEXT, reviewer TEXT, superseded_by TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS model_snapshots (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, basis_commit TEXT, basis_branch TEXT, generated_at TEXT NOT NULL, model_json TEXT NOT NULL, source_ids TEXT NOT NULL, confidence REAL, curator_version TEXT NOT NULL)"
+    )
     cur = conn.execute("SELECT v FROM schema_meta WHERE k='version'")
     row = cur.fetchone()
     if row is None:
-        conn.execute("INSERT OR IGNORE INTO schema_meta (k, v) VALUES ('version', '2')")
+        conn.execute("INSERT OR IGNORE INTO schema_meta (k, v) VALUES ('version', '3')")
     else:
-        conn.execute("UPDATE schema_meta SET v='2' WHERE k='version'")
+        conn.execute("UPDATE schema_meta SET v='3' WHERE k='version'")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_project_type_status ON memories(project_id, type, status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_project_task_status ON memories(project_id, task_status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_project_source ON evidence(project_id, source)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_project_created ON events(project_id, created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_handovers_project_created ON handovers(project_id, created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_links_project ON links(project_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_proposals_project_status ON proposals(project_id, status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_project_time ON model_snapshots(project_id, generated_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_dedup ON events(project_id, dedup_key)")
     conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(id UNINDEXED, type UNINDEXED, text)")
 
 
@@ -146,12 +226,18 @@ def backfill_project_id(conn: sqlite3.Connection, project_id: str) -> int:
 
 def init_db(db_path: str | Path | None = None) -> sqlite3.Connection:
     conn = get_connection(db_path)
+    migrated = False
     try:
         conn.executescript(SCHEMA)
     except sqlite3.OperationalError as e:
-        if "no such column: project_id" not in str(e) and "duplicate column" not in str(e).lower():
+        msg = str(e).lower()
+        if "no such column" in msg or "duplicate column" in msg:
+            migrated = True
+            migrate(conn)
+        else:
             raise
-    migrate(conn)
+    if not migrated:
+        migrate(conn)
     cfg_path: Path | None = None
     if db_path:
         cfg_path = Path(str(db_path)).parent / "config.json"
