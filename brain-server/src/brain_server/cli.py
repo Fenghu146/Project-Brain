@@ -1,0 +1,282 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+from .db import DEFAULT_DB_PATH, init_db
+from .models import BrainAskRequest, BrainHandoverRequest, BrainOnboardRequest, BrainRecordRequest, RecordInput
+
+
+def resolve_db(db_arg: str | None) -> Path:
+    if db_arg:
+        return Path(db_arg).expanduser().resolve()
+    cur = Path.cwd().resolve()
+    for p in [cur, *cur.parents]:
+        if (p / ".brain" / "brain.db").exists() or (p / ".brain" / "config.json").exists():
+            return (p / ".brain" / "brain.db").resolve()
+    return (Path.cwd() / ".brain" / "brain.db").resolve()
+
+
+def resolve_project_id(db_path: Path, explicit: str | None) -> str | None:
+    if explicit:
+        return explicit
+    cfg = db_path.parent / "config.json"
+    if cfg.exists():
+        try:
+            return json.loads(cfg.read_text(encoding="utf-8")).get("project_id")
+        except Exception:
+            return None
+    return None
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    from datetime import datetime, timezone
+
+    target_dir = Path(args.dir).expanduser().resolve() if args.dir else Path.cwd().resolve()
+    brain_dir = target_dir / ".brain"
+    db_path = Path(args.db).expanduser().resolve() if args.db else brain_dir / "brain.db"
+    project_id = args.project or target_dir.name
+
+    conn = init_db(str(db_path))
+    conn.close()
+    cfg_path = db_path.parent / "config.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg = {"project_id": project_id, "created_at": datetime.now(timezone.utc).isoformat(), "version": "0.1.0"}
+    cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Brain initialized: {db_path}")
+    print(f"Config: {cfg_path} (project_id={project_id})")
+
+    if args.seed:
+        from .protocol import brain_record
+
+        seed = BrainRecordRequest(
+            project_id=project_id,
+            agent_id="system",
+            session_id="init",
+            records=[
+                RecordInput(type="identity", content={"name": project_id, "purpose": args.purpose or f"{project_id} project"}, status="active", tags=[project_id]),
+                RecordInput(type="state", content={"current_goal": "初始化完成，待写入首个任务", "phase": "init", "blockers": [], "open_questions": [], "recent_changes": ["brain init"]}, status="active"),
+                RecordInput(type="task", content={"title": "首个任务（占位）", "status": "draft", "remaining": ["明确首个目标"], "next_step": "明确首个目标"}, status="draft"),
+            ],
+        )
+        resp = brain_record(seed, db_path=str(db_path))
+        print(f"Seed: accepted={resp.accepted}")
+
+    return 0
+
+
+def cmd_onboard(args: argparse.Namespace) -> int:
+    from .protocol import brain_onboard
+
+    db_path = resolve_db(args.db)
+    project_id = resolve_project_id(db_path, args.project)
+    if not project_id:
+        print("error: --project is required (no config found)", file=sys.stderr)
+        return 2
+    req = BrainOnboardRequest(project_id=project_id, agent_id=args.agent, session_id=args.session, focus=args.focus, token_budget=args.token_budget)
+    resp = brain_onboard(req, db_path=str(db_path))
+    print(json.dumps(resp.model_dump(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    from .protocol import brain_ask
+
+    db_path = resolve_db(args.db)
+    project_id = resolve_project_id(db_path, args.project)
+    if not project_id:
+        print("error: --project is required", file=sys.stderr)
+        return 2
+    scope = [s.strip() for s in args.scope.split(",") if s.strip()] if args.scope else None
+    req = BrainAskRequest(project_id=project_id, agent_id=args.agent, session_id=args.session, question=args.question, scope=scope, include_evidence=not args.no_evidence, limit=args.limit)
+    resp = brain_ask(req, db_path=str(db_path))
+    print(json.dumps(resp.model_dump(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_record(args: argparse.Namespace) -> int:
+    from .protocol import brain_record
+
+    db_path = resolve_db(args.db)
+    project_id = resolve_project_id(db_path, args.project)
+    if not project_id:
+        print("error: --project is required", file=sys.stderr)
+        return 2
+
+    records: list[RecordInput] = []
+    if args.file:
+        data = json.loads(Path(args.file).read_text(encoding="utf-8"))
+        raw_records = data if isinstance(data, list) else data.get("records", [])
+        for r in raw_records:
+            records.append(RecordInput(**r))
+    else:
+        if not args.type or not args.content:
+            print("error: --type and --content are required (or use --file)", file=sys.stderr)
+            return 2
+        try:
+            content = json.loads(args.content)
+        except Exception:
+            content = args.content
+        tags = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else None
+        evidence = json.loads(args.evidence) if args.evidence else None
+        records.append(RecordInput(type=args.type, content=content, status=args.status, confidence=args.confidence, tags=tags, evidence=evidence))
+
+    req = BrainRecordRequest(project_id=project_id, agent_id=args.agent, session_id=args.session, records=records)
+    resp = brain_record(req, db_path=str(db_path))
+    print(json.dumps(resp.model_dump(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_handover(args: argparse.Namespace) -> int:
+    from .protocol import brain_handover
+
+    db_path = resolve_db(args.db)
+    project_id = resolve_project_id(db_path, args.project)
+    if not project_id:
+        print("error: --project is required", file=sys.stderr)
+        return 2
+
+    def _list(v: str | None) -> list[str]:
+        if not v:
+            return []
+        try:
+            parsed = json.loads(v)
+            if isinstance(parsed, list):
+                return [str(x) for x in parsed]
+        except Exception:
+            pass
+        return [s.strip() for s in v.split(",") if s.strip()]
+
+    completed = _list(args.completed)
+    failed = _list(args.failed)
+    discovered = _list(args.discovered)
+    remaining = _list(args.remaining)
+    evidence_ids = _list(args.evidence_ids)
+
+    req = BrainHandoverRequest(
+        project_id=project_id,
+        agent_id=args.agent,
+        session_id=args.session,
+        task_id=args.task,
+        status=args.status,  # type: ignore[arg-type]
+        completed=completed,
+        failed=failed,
+        discovered=discovered,
+        remaining=remaining,
+        recommended_next_step=args.next_step,
+        evidence_ids=evidence_ids,
+    )
+    resp = brain_handover(req, db_path=str(db_path))
+    print(json.dumps(resp.model_dump(), ensure_ascii=False, indent=2))
+    md = db_path.parent / "exports" / "latest-handover.md"
+    if md.exists():
+        print(f"\nMarkdown: {md}", file=sys.stderr)
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    import sqlite3
+
+    db_path = resolve_db(args.db)
+    if not db_path.exists():
+        print(f"no brain at {db_path} — run `brain init` first", file=sys.stderr)
+        return 1
+    from .db import get_connection
+
+    conn = get_connection(str(db_path))
+    cur = conn.execute("SELECT type, status, count(*) as c FROM memories GROUP BY type, status ORDER BY type")
+    rows = cur.fetchall()
+    print(f"DB: {db_path}")
+    cfg = db_path.parent / "config.json"
+    if cfg.exists():
+        print(f"Config: {cfg.read_text(encoding='utf-8')}")
+    print("Memories:")
+    for r in rows:
+        print(f"  {r['type']:12} {r['status']:10} {r['c']}")
+    cur = conn.execute("SELECT count(*) as c FROM evidence")
+    print(f"Evidence: {cur.fetchone()['c']}")
+    cur = conn.execute("SELECT count(*) as c FROM handovers")
+    print(f"Handovers: {cur.fetchone()['c']}")
+    cur = conn.execute("SELECT count(*) as c FROM events")
+    print(f"Events: {cur.fetchone()['c']}")
+    md = db_path.parent / "exports" / "latest-handover.md"
+    if md.exists():
+        print(f"Latest handover: {md}")
+        print(md.read_text(encoding="utf-8")[:800])
+    conn.close()
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="brain", description="Project Brain CLI — cross-project brain management")
+    p.add_argument("--db", help="path to .brain/brain.db (default: auto-detect .brain/ upwards)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("init", help="initialize a brain in target project")
+    s.add_argument("--project", help="project_id (default: directory name)")
+    s.add_argument("--dir", help="target project directory (default: cwd)")
+    s.add_argument("--purpose", help="identity purpose for seed")
+    s.add_argument("--seed", action="store_true", help="write minimal identity/state/task seed")
+    s.set_defaults(func=cmd_init)
+
+    s = sub.add_parser("onboard", help="get onboarding brief for a new agent")
+    s.add_argument("--project", help="project_id (default: from .brain/config.json)")
+    s.add_argument("--agent", required=True, help="agent_id")
+    s.add_argument("--session", help="session_id")
+    s.add_argument("--focus", help="focus topic for contextual brief")
+    s.add_argument("--token-budget", type=int, default=1800)
+    s.set_defaults(func=cmd_onboard)
+
+    s = sub.add_parser("ask", help="ask brain with natural language")
+    s.add_argument("--project", help="project_id")
+    s.add_argument("--agent", required=True)
+    s.add_argument("--session", help="session_id")
+    s.add_argument("--question", required=True, help="question text")
+    s.add_argument("--scope", help="comma-separated scope filter, e.g. 'uart,dma'")
+    s.add_argument("--limit", type=int, default=8)
+    s.add_argument("--no-evidence", action="store_true")
+    s.set_defaults(func=cmd_ask)
+
+    s = sub.add_parser("record", help="record knowledge/experience/decision/task/evidence/event")
+    s.add_argument("--project", help="project_id")
+    s.add_argument("--agent", required=True)
+    s.add_argument("--session", help="session_id")
+    s.add_argument("--type", dest="type", help="record type: identity/state/knowledge/experience/decision/task/evidence/event")
+    s.add_argument("--content", help="JSON string or plain text content")
+    s.add_argument("--status", help="status, e.g. active/verified/proposed")
+    s.add_argument("--tags", help="comma-separated tags")
+    s.add_argument("--evidence", help="JSON array of evidence objects")
+    s.add_argument("--confidence", type=float, help="confidence 0-1")
+    s.add_argument("--file", help="JSON file containing records array")
+    s.set_defaults(func=cmd_record)
+
+    s = sub.add_parser("handover", help="create a handover report")
+    s.add_argument("--project", help="project_id")
+    s.add_argument("--agent", required=True)
+    s.add_argument("--session", help="session_id")
+    s.add_argument("--task", help="task_id, e.g. T-001")
+    s.add_argument("--status", required=True, choices=["completed", "partial", "failed"])
+    s.add_argument("--completed", help='JSON array or comma-separated, e.g. \'["done1","done2"]\'')
+    s.add_argument("--failed", help="JSON array or comma-separated")
+    s.add_argument("--discovered", help="JSON array or comma-separated")
+    s.add_argument("--remaining", help="JSON array or comma-separated")
+    s.add_argument("--next-step", help="recommended next step text")
+    s.add_argument("--evidence-ids", help="comma-separated evidence ids")
+    s.set_defaults(func=cmd_handover)
+
+    s = sub.add_parser("status", help="show brain overview")
+    s.set_defaults(func=cmd_status)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
