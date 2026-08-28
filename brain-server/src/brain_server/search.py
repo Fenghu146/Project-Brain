@@ -64,11 +64,11 @@ def _has_evidence(conn: sqlite3.Connection, mem_id: str, project_id: str) -> boo
 
 class FTSProvider:
     def search(self, conn: sqlite3.Connection, project_id: str, query: str, scope: list[str] | None, limit: int) -> list[dict[str, Any]]:
-        raw_candidates = repo.fts_search(conn, query, limit=limit * 4, project_id=project_id)
-        if isinstance(raw_candidates, tuple):
-            raw_candidates, metrics = raw_candidates
+        raw = repo.fts_search(conn, query, limit=limit * 4, project_id=project_id)
+        if isinstance(raw, tuple):
+            raw_candidates, _metrics = raw
         else:
-            metrics = {}
+            raw_candidates = raw
         scored: list[tuple[float, str, list[str], dict[str, Any]]] = []
         mode = "fts"
         if not raw_candidates:
@@ -89,7 +89,7 @@ class FTSProvider:
         for score, m, terms, r in scored:
             if score < RELEVANCE_THRESHOLD:
                 continue
-            out.append({"score": score, "match_mode": m, "matched_terms": terms, "row": r, **metrics})
+            out.append({"score": score, "match_mode": m, "matched_terms": terms, "row": r})
             if len(out) >= limit:
                 break
         return out
@@ -134,10 +134,7 @@ def ranked_search(
         mode = "fts"
     rows = [s["row"] for s in scored]
     matches = [{"id": s["row"]["id"], "score": s["score"], "matched_terms": s["matched_terms"], "match_mode": s["match_mode"]} for s in scored]
-    # Add observability metrics from first match if available
-    if scored and "candidate_count" in scored[0]:
-        for m in matches:
-            m.update({k: v for k, v in scored[0].items() if k in ("candidate_count", "filtered_count", "elapsed_ms", "provider", "index_version")})
+    pass
     # Embedding provider is optional: if provider is EmbeddingProvider and returns low/跨项目, it already went through same threshold
     return mode, rows, matches
 

@@ -243,12 +243,12 @@ def get_evidence(conn: sqlite3.Connection, ev_id: str, project_id: str | None = 
         "metadata": json.loads(row["metadata_json"]) if row["metadata_json"] else {},
         "status": row["status"],
         "created_at": row["created_at"],
-        "locator_type": row.get("locator_type") or "absolute",
-        "path": row.get("path"),
-        "project_root_hint": row.get("project_root_hint"),
-        "content_hash": row.get("content_hash"),
-        "commit_hash": row.get("commit_hash"),
-        "branch": row.get("branch"),
+        "locator_type": row["locator_type"] if "locator_type" in row.keys() and row["locator_type"] else "absolute",
+        "path": row["path"] if "path" in row.keys() else None,
+        "project_root_hint": row["project_root_hint"] if "project_root_hint" in row.keys() else None,
+        "content_hash": row["content_hash"] if "content_hash" in row.keys() else None,
+        "commit_hash": row["commit_hash"] if "commit_hash" in row.keys() else None,
+        "branch": row["branch"] if "branch" in row.keys() else None,
     }
 
 
@@ -271,12 +271,12 @@ def list_evidence(conn: sqlite3.Connection, project_id: str | None = None, limit
             "metadata": json.loads(r["metadata_json"]) if r["metadata_json"] else {},
             "status": r["status"],
             "created_at": r["created_at"],
-            "locator_type": r.get("locator_type") or "absolute",
-            "path": r.get("path"),
-            "project_root_hint": r.get("project_root_hint"),
-            "content_hash": r.get("content_hash"),
-            "commit_hash": r.get("commit_hash"),
-            "branch": r.get("branch"),
+            "locator_type": r["locator_type"] if "locator_type" in r.keys() and r["locator_type"] else "absolute",
+            "path": r["path"] if "path" in r.keys() else None,
+            "project_root_hint": r["project_root_hint"] if "project_root_hint" in r.keys() else None,
+            "content_hash": r["content_hash"] if "content_hash" in r.keys() else None,
+            "commit_hash": r["commit_hash"] if "commit_hash" in r.keys() else None,
+            "branch": r["branch"] if "branch" in r.keys() else None,
         }
         for r in cur.fetchall()
     ]
@@ -693,30 +693,23 @@ def fts_search(
     query: str,
     limit: int = 20,
     project_id: str | None = None,
-) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """FTS search with project isolation and observability metrics."""
-    import time
-    start = time.time()
-    
+) -> list[dict[str, Any]] | tuple[list[dict[str, Any]], dict[str, int]]:
+    """FTS search with project isolation."""
     if not query or not query.strip():
-        return [], {"candidate_count": 0, "filtered_count": 0, "elapsed_ms": 0}
-    
+        return []
+
     fts_rows: list[dict[str, Any]] = []
-    metrics = {"candidate_count": 0, "filtered_count": 0, "elapsed_ms": 0}
-    
+
     try:
-        # Query with project_id filtering in FTS
         cur = conn.execute(
             "SELECT m.* FROM memory_fts f JOIN memories m ON m.id=f.id "
             "WHERE f.project_id=? AND memory_fts MATCH ? ORDER BY rank LIMIT ?",
             (project_id or "default", query, limit * 3),
         )
         fts_rows = [_row_to_memory(r) for r in cur.fetchall()]
-        metrics["candidate_count"] = len(fts_rows)
     except sqlite3.OperationalError:
         pass
-    
-    # Fallback: query without project filter, then filter in Python
+
     if not fts_rows:
         try:
             cur = conn.execute(
@@ -725,19 +718,15 @@ def fts_search(
                 (query, limit * 3),
             )
             fts_rows = [_row_to_memory(r) for r in cur.fetchall()]
-            metrics["candidate_count"] = len(fts_rows)
-            
-            # Apply project filter
             if project_id:
                 fts_rows = [r for r in fts_rows if r.get("project_id") == project_id]
-                metrics["filtered_count"] = metrics["candidate_count"] - len(fts_rows)
         except sqlite3.OperationalError:
             pass
-    
-    elapsed_ms = int((time.time() - start) * 1000)
-    metrics["elapsed_ms"] = elapsed_ms
-    
-    return fts_rows, metrics
+
+    if fts_rows:
+        return fts_rows
+
+    return _like_fallback(conn, query, limit, project_id=project_id)
 
 
 def count_memories(conn: sqlite3.Connection, project_id: str | None = None) -> int:

@@ -521,9 +521,25 @@ def cmd_backup(args: argparse.Namespace) -> int:
     backup_dir = Path(target_dir) / f"backup-{timestamp}"
     backup_dir.mkdir(parents=True, exist_ok=True)
 
-    # Copy database
+    # Copy database — checkpoint WAL first and use backup API for hot backup safety
     db_dest = backup_dir / "brain.db"
-    shutil.copy2(db_path, db_dest)
+    try:
+        import sqlite3 as _sqlite3
+        src = _sqlite3.connect(str(db_path), timeout=30.0)
+        src.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        src.commit()
+        src.close()
+    except Exception:
+        pass
+    try:
+        import sqlite3 as _sqlite3
+        src = _sqlite3.connect(str(db_path), timeout=30.0)
+        dst = _sqlite3.connect(str(db_dest), timeout=30.0)
+        src.backup(dst)
+        dst.close()
+        src.close()
+    except Exception:
+        shutil.copy2(db_path, db_dest)
 
     # Copy config
     cfg_src = db_path.parent / "config.json"
@@ -606,6 +622,21 @@ def cmd_restore(args: argparse.Namespace) -> int:
     print(f"Restored from {backup_path} to {target_db}")
     return 0
 
+
+def _inferred_agent_id(db_path, explicit):
+    if explicit:
+        return explicit
+    try:
+        from .db import get_connection as _gc
+        conn = _gc(str(db_path))
+        c = conn.execute("SELECT agent_id FROM handovers ORDER BY created_at DESC LIMIT 1").fetchone()
+        if c and c["agent_id"]:
+            conn.close()
+            return c["agent_id"]
+        conn.close()
+    except Exception:
+        pass
+    return "cli-user"
 
 def cmd_capabilities(args: argparse.Namespace) -> int:
     db_path = resolve_db(args.db)

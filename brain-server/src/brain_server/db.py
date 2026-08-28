@@ -221,9 +221,9 @@ def migrate(conn: sqlite3.Connection) -> None:
     cur = conn.execute("SELECT v FROM schema_meta WHERE k='version'")
     row = cur.fetchone()
     if row is None:
-        conn.execute("INSERT OR IGNORE INTO schema_meta (k, v) VALUES ('version', '3')")
+        conn.execute("INSERT OR IGNORE INTO schema_meta (k, v) VALUES ('version', '4')")
     else:
-        conn.execute("UPDATE schema_meta SET v='3' WHERE k='version'")
+        conn.execute("UPDATE schema_meta SET v='4' WHERE k='version'")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_project_type_status ON memories(project_id, type, status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_project_task_status ON memories(project_id, task_status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_project_source ON evidence(project_id, source)")
@@ -233,9 +233,11 @@ def migrate(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_proposals_project_status ON proposals(project_id, status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_project_time ON model_snapshots(project_id, generated_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_dedup ON events(project_id, dedup_key)")
-    # 确保 memory_fts 有 project_id 列
-    _ensure_column(conn, "memory_fts", "project_id", "project_id TEXT")
-    conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(id UNINDEXED, type UNINDEXED, project_id UNINDEXED, text)")
+    # 确保 memory_fts 有 project_id 列（虚表不可 ALTER，需重建时已在 SCHEMA 中）
+    try:
+        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(id UNINDEXED, type UNINDEXED, project_id UNINDEXED, text)")
+    except Exception:
+        pass
 
 
 def backfill_project_id(conn: sqlite3.Connection, project_id: str) -> int:
