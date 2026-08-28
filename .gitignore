@@ -1,0 +1,16 @@
+.brain/brain.db
+.brain/*.db-journal
+.brain/*.db-wal
+.brain/*.db-shm
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+*.log
+.mypy_cache/
