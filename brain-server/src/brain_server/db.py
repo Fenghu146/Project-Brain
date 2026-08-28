@@ -151,6 +151,58 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_project_time
   ON model_snapshots(project_id, generated_at);
 CREATE INDEX IF NOT EXISTS idx_events_dedup
   ON events(project_id, dedup_key);
+
+CREATE TABLE IF NOT EXISTS sessions (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+  basis_commit TEXT,
+  basis_branch TEXT,
+  status TEXT NOT NULL DEFAULT 'active',
+  last_event_at TEXT,
+  automation_mode TEXT NOT NULL DEFAULT 'full',
+  metadata_json TEXT
+);
+
+CREATE TABLE IF NOT EXISTS automation_runs (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  trigger TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'running',
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  created_event_ids TEXT,
+  created_evidence_ids TEXT,
+  created_proposal_ids TEXT,
+  warnings TEXT,
+  error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS handover_drafts (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  task_id TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  report_json TEXT NOT NULL,
+  source_event_ids TEXT NOT NULL,
+  proposal_ids TEXT,
+  basis_commit TEXT,
+  generated_by TEXT NOT NULL,
+  applied_handover_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_project_status
+  ON sessions(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_automation_runs_project_session
+  ON automation_runs(project_id, session_id);
+CREATE INDEX IF NOT EXISTS idx_handover_drafts_project_status
+  ON handover_drafts(project_id, status);
 """
 
 
@@ -238,6 +290,13 @@ def migrate(conn: sqlite3.Connection) -> None:
         conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(id UNINDEXED, type UNINDEXED, project_id UNINDEXED, text)")
     except Exception:
         pass
+    # v0.5: sessions/automation_runs/handover_drafts tables
+    conn.execute("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, agent_id TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT, basis_commit TEXT, basis_branch TEXT, status TEXT NOT NULL DEFAULT 'active', last_event_at TEXT, automation_mode TEXT NOT NULL DEFAULT 'full', metadata_json TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS automation_runs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, session_id TEXT NOT NULL, trigger TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'running', started_at TEXT NOT NULL, finished_at TEXT, created_event_ids TEXT, created_evidence_ids TEXT, created_proposal_ids TEXT, warnings TEXT, error TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS handover_drafts (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, session_id TEXT NOT NULL, task_id TEXT, status TEXT NOT NULL DEFAULT 'pending', report_json TEXT NOT NULL, source_event_ids TEXT NOT NULL, proposal_ids TEXT, basis_commit TEXT, generated_by TEXT NOT NULL, applied_handover_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_project_status ON sessions(project_id, status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_automation_runs_project_session ON automation_runs(project_id, session_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_handover_drafts_project_status ON handover_drafts(project_id, status)")
 
 
 def backfill_project_id(conn: sqlite3.Connection, project_id: str) -> int:

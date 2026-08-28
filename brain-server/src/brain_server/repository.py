@@ -735,3 +735,231 @@ def count_memories(conn: sqlite3.Connection, project_id: str | None = None) -> i
     else:
         cur = conn.execute("SELECT COUNT(*) as c FROM memories")
     return cur.fetchone()["c"]
+
+
+# v0.5: Workflow tables methods
+
+
+def create_session(
+    conn: sqlite3.Connection,
+    session_id: str,
+    project_id: str,
+    agent_id: str,
+    basis_commit: str | None = None,
+    basis_branch: str | None = None,
+    automation_mode: str = "full",
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    ts = now_iso()
+    conn.execute(
+        "INSERT INTO sessions (id, project_id, agent_id, started_at, basis_commit, basis_branch, status, automation_mode, metadata_json) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)",
+        (session_id, project_id, agent_id, ts, basis_commit, basis_branch, automation_mode, json.dumps(metadata or {}, ensure_ascii=False)),
+    )
+    return session_id
+
+
+def get_session(conn: sqlite3.Connection, session_id: str, project_id: str) -> dict[str, Any] | None:
+    cur = conn.execute("SELECT * FROM sessions WHERE id=? AND project_id=?", (session_id, project_id))
+    row = cur.fetchone()
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "project_id": row["project_id"],
+        "agent_id": row["agent_id"],
+        "started_at": row["started_at"],
+        "ended_at": row["ended_at"],
+        "basis_commit": row["basis_commit"],
+        "basis_branch": row["basis_branch"],
+        "status": row["status"],
+        "last_event_at": row["last_event_at"],
+        "automation_mode": row["automation_mode"],
+        "metadata": json.loads(row["metadata_json"]) if row["metadata_json"] else {},
+    }
+
+
+def update_session_status(conn: sqlite3.Connection, session_id: str, project_id: str, status: str, last_event_at: str | None = None) -> None:
+    if last_event_at:
+        conn.execute("UPDATE sessions SET status=?, last_event_at=? WHERE id=? AND project_id=?", (status, last_event_at, session_id, project_id))
+    else:
+        conn.execute("UPDATE sessions SET status=? WHERE id=? AND project_id=?", (status, session_id, project_id))
+
+
+def list_sessions(conn: sqlite3.Connection, project_id: str, status: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    q = "SELECT * FROM sessions WHERE project_id=?"
+    params: list[Any] = [project_id]
+    if status:
+        q += " AND status=?"
+        params.append(status)
+    q += " ORDER BY started_at DESC LIMIT ?"
+    params.append(limit)
+    cur = conn.execute(q, params)
+    return [
+        {
+            "id": r["id"],
+            "project_id": r["project_id"],
+            "agent_id": r["agent_id"],
+            "started_at": r["started_at"],
+            "ended_at": r["ended_at"],
+            "basis_commit": r["basis_commit"],
+            "basis_branch": r["basis_branch"],
+            "status": r["status"],
+            "last_event_at": r["last_event_at"],
+            "automation_mode": r["automation_mode"],
+            "metadata": json.loads(r["metadata_json"]) if r["metadata_json"] else {},
+        }
+        for r in cur.fetchall()
+    ]
+
+
+def create_automation_run(
+    conn: sqlite3.Connection,
+    run_id: str,
+    project_id: str,
+    session_id: str,
+    trigger: str,
+    started_at: str,
+    event_ids: list[str] | None = None,
+    evidence_ids: list[str] | None = None,
+    proposal_ids: list[str] | None = None,
+    warnings: list[str] | None = None,
+    error: str | None = None,
+) -> str:
+    conn.execute(
+        "INSERT INTO automation_runs (id, project_id, session_id, trigger, status, started_at, created_event_ids, created_evidence_ids, created_proposal_ids, warnings, error) VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)",
+        (run_id, project_id, session_id, trigger, started_at, json.dumps(event_ids or [], ensure_ascii=False), json.dumps(evidence_ids or [], ensure_ascii=False), json.dumps(proposal_ids or [], ensure_ascii=False), json.dumps(warnings or [], ensure_ascii=False), error or ""),
+    )
+    return run_id
+
+
+def update_automation_run(
+    conn: sqlite3.Connection,
+    run_id: str,
+    project_id: str,
+    status: str,
+    finished_at: str | None = None,
+    warnings: list[str] | None = None,
+    error: str | None = None,
+) -> None:
+    if finished_at:
+        conn.execute(
+            "UPDATE automation_runs SET status=?, finished_at=?, warnings=?, error=? WHERE id=? AND project_id=?",
+            (status, finished_at, json.dumps(warnings or [], ensure_ascii=False), error or "", run_id, project_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE automation_runs SET status=?, warnings=?, error=? WHERE id=? AND project_id=?",
+            (status, json.dumps(warnings or [], ensure_ascii=False), error or "", run_id, project_id),
+        )
+
+
+def list_automation_runs(conn: sqlite3.Connection, project_id: str, session_id: str | None = None, status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    q = "SELECT * FROM automation_runs WHERE project_id=?"
+    params: list[Any] = [project_id]
+    if session_id:
+        q += " AND session_id=?"
+        params.append(session_id)
+    if status:
+        q += " AND status=?"
+        params.append(status)
+    q += " ORDER BY started_at DESC LIMIT ?"
+    params.append(limit)
+    cur = conn.execute(q, params)
+    return [
+        {
+            "id": r["id"],
+            "project_id": r["project_id"],
+            "session_id": r["session_id"],
+            "trigger": r["trigger"],
+            "status": r["status"],
+            "started_at": r["started_at"],
+            "finished_at": r["finished_at"],
+            "created_event_ids": json.loads(r["created_event_ids"]) if r["created_event_ids"] else [],
+            "created_evidence_ids": json.loads(r["created_evidence_ids"]) if r["created_evidence_ids"] else [],
+            "created_proposal_ids": json.loads(r["created_proposal_ids"]) if r["created_proposal_ids"] else [],
+            "warnings": json.loads(r["warnings"]) if r["warnings"] else [],
+            "error": r["error"],
+        }
+        for r in cur.fetchall()
+    ]
+
+
+def create_handover_draft(
+    conn: sqlite3.Connection,
+    draft_id: str,
+    project_id: str,
+    session_id: str,
+    task_id: str | None,
+    report: dict[str, Any],
+    source_event_ids: list[str],
+    proposal_ids: list[str] | None = None,
+    basis_commit: str | None = None,
+    generated_by: str = "workflow",
+) -> str:
+    ts = now_iso()
+    conn.execute(
+        "INSERT INTO handover_drafts (id, project_id, session_id, task_id, status, report_json, source_event_ids, proposal_ids, basis_commit, generated_by, created_at, updated_at) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)",
+        (draft_id, project_id, session_id, task_id, json.dumps(report, ensure_ascii=False), json.dumps(source_event_ids, ensure_ascii=False), json.dumps(proposal_ids or [], ensure_ascii=False), basis_commit, generated_by, ts, ts),
+    )
+    return draft_id
+
+
+def get_handover_draft(conn: sqlite3.Connection, draft_id: str, project_id: str) -> dict[str, Any] | None:
+    cur = conn.execute("SELECT * FROM handover_drafts WHERE id=? AND project_id=?", (draft_id, project_id))
+    row = cur.fetchone()
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "project_id": row["project_id"],
+        "session_id": row["session_id"],
+        "task_id": row["task_id"],
+        "status": row["status"],
+        "report": json.loads(row["report_json"]),
+        "source_event_ids": json.loads(row["source_event_ids"]),
+        "proposal_ids": json.loads(row["proposal_ids"]) if row["proposal_ids"] else [],
+        "basis_commit": row["basis_commit"],
+        "generated_by": row["generated_by"],
+        "applied_handover_id": row["applied_handover_id"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def update_handover_draft_status(conn: sqlite3.Connection, draft_id: str, project_id: str, status: str, applied_handover_id: str | None = None) -> None:
+    if applied_handover_id:
+        conn.execute("UPDATE handover_drafts SET status=?, applied_handover_id=? WHERE id=? AND project_id=?", (status, applied_handover_id, draft_id, project_id))
+    else:
+        conn.execute("UPDATE handover_drafts SET status=? WHERE id=? AND project_id=?", (status, draft_id, project_id))
+
+
+def list_handover_drafts(conn: sqlite3.Connection, project_id: str, session_id: str | None = None, status: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    q = "SELECT * FROM handover_drafts WHERE project_id=?"
+    params: list[Any] = [project_id]
+    if session_id:
+        q += " AND session_id=?"
+        params.append(session_id)
+    if status:
+        q += " AND status=?"
+        params.append(status)
+    q += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    cur = conn.execute(q, params)
+    return [
+        {
+            "id": r["id"],
+            "project_id": r["project_id"],
+            "session_id": r["session_id"],
+            "task_id": r["task_id"],
+            "status": r["status"],
+            "report": json.loads(r["report_json"]),
+            "source_event_ids": json.loads(r["source_event_ids"]),
+            "proposal_ids": json.loads(r["proposal_ids"]) if r["proposal_ids"] else [],
+            "basis_commit": r["basis_commit"],
+            "generated_by": r["generated_by"],
+            "applied_handover_id": r["applied_handover_id"],
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+        }
+        for r in cur.fetchall()
+    ]
