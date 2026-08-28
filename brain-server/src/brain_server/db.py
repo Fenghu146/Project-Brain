@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-DEFAULT_DB_PATH = Path(__file__).parents[2].joinpath(".brain/brain.db").resolve()
+DEFAULT_DB_PATH = Path(__file__).parents[3].joinpath(".brain/brain.db").resolve()
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;

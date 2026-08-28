@@ -284,12 +284,30 @@ def fts_search(
             "SELECT m.* FROM memory_fts f JOIN memories m ON m.id=f.id WHERE memory_fts MATCH ? ORDER BY rank LIMIT ?",
             (query, limit),
         )
+        rows = [_row_to_memory(r) for r in cur.fetchall()]
     except sqlite3.OperationalError:
         cur = conn.execute(
             "SELECT m.* FROM memory_fts f JOIN memories m ON m.id=f.id WHERE memory_fts MATCH ? LIMIT ?",
             (query, limit),
         )
-    return [_row_to_memory(r) for r in cur.fetchall()]
+        rows = [_row_to_memory(r) for r in cur.fetchall()]
+    if rows:
+        return rows
+    toks = [t for t in query.replace("？", " ").replace("?", " ").replace("，", " ").replace(",", " ").split() if t.strip()]
+    if not toks:
+        toks = [query.strip()]
+    like_rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for tok in toks[:4]:
+        cur = conn.execute("SELECT * FROM memories WHERE content_json LIKE ? OR tags LIKE ? LIMIT ?", (f"%{tok}%", f"%{tok}%", limit))
+        for r in cur.fetchall():
+            m = _row_to_memory(r)
+            if m["id"] not in seen:
+                seen.add(m["id"])
+                like_rows.append(m)
+        if len(like_rows) >= limit:
+            break
+    return like_rows[:limit]
 
 
 def count_memories(conn: sqlite3.Connection) -> int:

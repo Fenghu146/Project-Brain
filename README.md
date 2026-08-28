@@ -46,4 +46,11 @@ make demo   # 端到端 Agent A → B 交接演示
 
 ## 验收
 
+- [x] 初始化 Brain 数据库
+- [x] 8 类实体存储（Identity/State/Knowledge/Experience/Decision/Evidence/Task/Event/Handovers）
+- [x] `brain.onboard` / `brain.ask` / `brain.record` / `brain.handover` 四协议
+- [x] MCP Server（`brain_server.server`，兼容 mcp 1.x/2.x）
+- [x] 端到端 Demo：`scripts/brain-demo.py`（Agent A → handover → Agent B onboard/ask）
+- [x] 重启可恢复（SQLite 落盘）
+
 见 `project-brain-v0.1.md` §14。

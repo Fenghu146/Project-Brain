@@ -321,12 +321,10 @@ def brain_handover(req: BrainHandoverRequest, db_path: str | Path | None = None)
 
         conn.commit()
 
-        exports_dir = Path(get_connection(db_path).execute("PRAGMA database_list").fetchone()[2]).parent / "exports" if db_path else Path(__file__).parents[2] / ".brain/exports"
         if db_path:
             exports_dir = Path(str(db_path)).parent / "exports"
         else:
-            from pathlib import Path as _P
-            exports_dir = _P(__file__).parents[2].joinpath(".brain/exports")
+            exports_dir = Path(__file__).parents[3].joinpath(".brain/exports")
         exports_dir.mkdir(parents=True, exist_ok=True)
         md = _handover_markdown(handover_id, report)
         (exports_dir / "latest-handover.md").write_text(md, encoding="utf-8")
