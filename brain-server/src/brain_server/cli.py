@@ -5,7 +5,7 @@ import json
 import sys
 from pathlib import Path
 
-from .db import DEFAULT_DB_PATH, init_db
+from .db import DEFAULT_DB_PATH, get_connection, init_db
 from .models import BrainAskRequest, BrainHandoverRequest, BrainOnboardRequest, BrainRecordRequest, RecordInput
 
 
@@ -638,6 +638,93 @@ def _inferred_agent_id(db_path, explicit):
         pass
     return "cli-user"
 
+def cmd_workflow(args: argparse.Namespace) -> int:
+    """Handle workflow automation commands."""
+    from .workflow import WorkflowBrain
+    from .workflow_models import WorkflowConfig
+
+    db_path = resolve_db(args.db)
+    project_id = resolve_project_id(db_path, args.project)
+    if not project_id:
+        print("error: --project is required (no config found)", file=sys.stderr)
+        return 2
+
+    config = WorkflowConfig(project_id=project_id)
+    wb = WorkflowBrain(db_path=str(db_path), config=config)
+
+    action = getattr(args, "action", None)
+    session_id = getattr(args, "session_id", None)
+    agent_id = getattr(args, "agent", "cli-user")
+    level = getattr(args, "level", "compact")
+
+    if action == "start":
+        start = wb.start_session(
+            project_id=project_id,
+            agent_id=agent_id,
+            level=level,
+            session_id=session_id,
+        )
+        print(json.dumps({
+            "session_id": start.session_id,
+            "context": start.context,
+            "basis_commit": start.basis_commit,
+            "warnings": start.warnings,
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    elif action == "observe":
+        # Read observation from stdin or args
+        import sys
+        if sys.stdin.isatty():
+            print("Enter observation JSON (Ctrl+D to send):", file=sys.stderr)
+            data = sys.stdin.read()
+        else:
+            data = sys.stdin.read()
+        try:
+            obs = json.loads(data)
+        except json.JSONDecodeError as e:
+            print(f"error: invalid JSON: {e}", file=sys.stderr)
+            return 2
+        receipt = wb.observe(
+            project_id=project_id,
+            observation=obs,
+            session_id=session_id or "default",
+        )
+        print(json.dumps({
+            "observation_id": receipt.observation_id,
+            "event_ids": receipt.event_ids,
+            "evidence_ids": receipt.evidence_ids,
+            "warnings": receipt.warnings,
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    elif action == "end":
+        draft = wb.end_session(
+            project_id=project_id,
+            session_id=session_id or "default",
+        )
+        print(json.dumps({
+            "draft_id": draft.draft_id,
+            "status": draft.status,
+            "report": draft.report,
+            "source_event_ids": draft.source_event_ids,
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    elif action == "status":
+        # Show current sessions
+        from .repository import list_sessions
+        conn = get_connection(str(db_path))
+        sessions = list_sessions(conn, project_id=project_id, limit=10)
+        conn.close()
+        print(json.dumps(sessions, ensure_ascii=False, indent=2))
+        return 0
+
+    else:
+        print("error: --action required (start|observe|end|status)", file=sys.stderr)
+        return 2
+
+
 def cmd_capabilities(args: argparse.Namespace) -> int:
     db_path = resolve_db(args.db)
     capabilities = {
@@ -841,6 +928,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("capabilities", help="show available capabilities")
     s.set_defaults(func=cmd_capabilities)
+
+    # v0.5: workflow subcommands
+    s = sub.add_parser("workflow", help="workflow automation management")
+    s.add_argument("--project", help="project_id")
+    s.add_argument("--action", help="start|observe|end|pause|resume|flush|status")
+    s.add_argument("--session-id", help="session_id")
+    s.add_argument("--agent", help="agent_id")
+    s.add_argument("--level", default="compact", choices=["compact", "focused", "full"])
+    s.set_defaults(func=cmd_workflow)
 
     return p
 
