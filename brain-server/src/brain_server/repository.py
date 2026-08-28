@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .db import get_connection
-from .models import MEMORY_PREFIX, EVIDENCE_PREFIX, EVENT_PREFIX, HANDOVER_PREFIX, now_iso, content_to_text
+from .models import MEMORY_PREFIX, EVIDENCE_PREFIX, EVENT_PREFIX, HANDOVER_PREFIX, now_iso, content_to_text, ConflictError
 
 
 def _fts_text(mem_type: str, content: Any, tags: list[str] | None) -> str:
@@ -14,6 +14,18 @@ def _fts_text(mem_type: str, content: Any, tags: list[str] | None) -> str:
     if tags:
         parts.append(" ".join(tags))
     return " ".join(parts)
+
+
+def _fts_upsert(conn: sqlite3.Connection, mem_id: str, mem_type: str, text: str, project_id: str) -> None:
+    """Insert or replace FTS entry for a memory."""
+    try:
+        conn.execute("INSERT INTO memory_fts (id, type, project_id, text) VALUES (?, ?, ?, ?)",
+                     (mem_id, mem_type, project_id, text))
+    except Exception:
+        # For FTS5, use DELETE + INSERT as REPLACE may not work reliably
+        conn.execute("DELETE FROM memory_fts WHERE id=?", (mem_id,))
+        conn.execute("INSERT INTO memory_fts (id, type, project_id, text) VALUES (?, ?, ?, ?)",
+                     (mem_id, mem_type, project_id, text))
 
 
 def next_id(conn: sqlite3.Connection, prefix: str, table: str, project_id: str | None = None) -> str:
@@ -72,7 +84,7 @@ def create_memory(
         (mem_id, project_id, mem_type, status, task_status, content_json, confidence, tags_json, created_by, ts, ts, valid_from, valid_until, branch, commit_hash, verification_due_at, origin),
     )
     fts_text = _fts_text(mem_type, content, tags)
-    conn.execute("INSERT INTO memory_fts (id, type, text) VALUES (?,?,?)", (mem_id, mem_type, fts_text))
+    _fts_upsert(conn, mem_id, mem_type, fts_text, project_id)
     return mem_id
 
 
@@ -85,6 +97,7 @@ def update_memory(
     confidence: float | None = None,
     tags: list[str] | None = None,
     project_id: str | None = None,
+    expected_revision: int | None = None,
 ) -> None:
     q = "SELECT * FROM memories WHERE id=?"
     params: list[Any] = [mem_id]
@@ -95,6 +108,12 @@ def update_memory(
     row = cur.fetchone()
     if row is None:
         raise KeyError(f"memory not found: {mem_id}")
+    # Optimistic lock check
+    current_revision = row["revision"] if "revision" in row.keys() else 1
+    if expected_revision is not None and current_revision != expected_revision:
+        raise ConflictError(
+            f"memory {mem_id} has been modified (revision {current_revision}, expected {expected_revision})"
+        )
     new_content_json = row["content_json"]
     new_type = row["type"]
     new_tags = json.loads(row["tags"]) if row["tags"] else []
@@ -106,14 +125,14 @@ def update_memory(
     new_task_status = task_status if task_status is not None else row["task_status"]
     new_conf = confidence if confidence is not None else row["confidence"]
     ts = now_iso()
+    new_revision = current_revision + 1
     conn.execute(
-        "UPDATE memories SET content_json=?, status=?, task_status=?, confidence=?, tags=?, updated_at=? WHERE id=?",
-        (new_content_json, new_status, new_task_status, new_conf, json.dumps(new_tags, ensure_ascii=False), ts, mem_id),
+        "UPDATE memories SET content_json=?, status=?, task_status=?, confidence=?, tags=?, updated_at=?, revision=? WHERE id=?",
+        (new_content_json, new_status, new_task_status, new_conf, json.dumps(new_tags, ensure_ascii=False), ts, new_revision, mem_id),
     )
     content_obj: Any = json.loads(new_content_json)
     fts_text = _fts_text(new_type, content_obj, new_tags)
-    conn.execute("DELETE FROM memory_fts WHERE id=?", (mem_id,))
-    conn.execute("INSERT INTO memory_fts (id, type, text) VALUES (?,?,?)", (mem_id, new_type, fts_text))
+    _fts_upsert(conn, mem_id, new_type, fts_text, row["project_id"])
 
 
 def get_memory(conn: sqlite3.Connection, mem_id: str, project_id: str | None = None) -> dict[str, Any] | None:
@@ -177,6 +196,7 @@ def _row_to_memory(row: sqlite3.Row) -> dict[str, Any]:
         "verification_due_at": row["verification_due_at"] if "verification_due_at" in row.keys() else None,
         "origin": row["origin"] if "origin" in row.keys() else "user",
         "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None,
+        "revision": row["revision"] if "revision" in row.keys() else 1,
     }
 
 
@@ -189,13 +209,17 @@ def create_evidence(
     status: str = "observed",
     ev_id: str | None = None,
     project_id: str = "default",
+    locator_type: str = "absolute",
+    path: str | None = None,
+    project_root_hint: str | None = None,
+    content_hash: str | None = None,
 ) -> str:
     if ev_id is None:
         ev_id = next_id(conn, EVIDENCE_PREFIX, "evidence", project_id=project_id)
     ts = now_iso()
     conn.execute(
-        "INSERT INTO evidence (id, project_id, type, source, description, metadata_json, status, created_at) VALUES (?,?,?,?,?,?,?,?)",
-        (ev_id, project_id, ev_type, source, description, json.dumps(metadata or {}, ensure_ascii=False), status, ts),
+        "INSERT INTO evidence (id, project_id, type, source, description, metadata_json, status, created_at, locator_type, path, project_root_hint, content_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (ev_id, project_id, ev_type, source, description, json.dumps(metadata or {}, ensure_ascii=False), status, ts, locator_type, path, project_root_hint, content_hash),
     )
     return ev_id
 
@@ -219,6 +243,12 @@ def get_evidence(conn: sqlite3.Connection, ev_id: str, project_id: str | None = 
         "metadata": json.loads(row["metadata_json"]) if row["metadata_json"] else {},
         "status": row["status"],
         "created_at": row["created_at"],
+        "locator_type": row.get("locator_type") or "absolute",
+        "path": row.get("path"),
+        "project_root_hint": row.get("project_root_hint"),
+        "content_hash": row.get("content_hash"),
+        "commit_hash": row.get("commit_hash"),
+        "branch": row.get("branch"),
     }
 
 
@@ -241,6 +271,12 @@ def list_evidence(conn: sqlite3.Connection, project_id: str | None = None, limit
             "metadata": json.loads(r["metadata_json"]) if r["metadata_json"] else {},
             "status": r["status"],
             "created_at": r["created_at"],
+            "locator_type": r.get("locator_type") or "absolute",
+            "path": r.get("path"),
+            "project_root_hint": r.get("project_root_hint"),
+            "content_hash": r.get("content_hash"),
+            "commit_hash": r.get("commit_hash"),
+            "branch": r.get("branch"),
         }
         for r in cur.fetchall()
     ]
@@ -248,6 +284,70 @@ def list_evidence(conn: sqlite3.Connection, project_id: str | None = None, limit
 
 def create_link(conn: sqlite3.Connection, from_id: str, relation: str, to_id: str, project_id: str = "default") -> None:
     conn.execute("INSERT OR IGNORE INTO links (from_id, project_id, relation, to_id) VALUES (?,?,?,?)", (from_id, project_id, relation, to_id))
+
+
+def resolve_evidence_path(ev: dict[str, Any], project_root: Path | None = None) -> tuple[str, str]:
+    """Resolve evidence path, return (resolved_path, health_status).
+    
+    Resolution priority:
+    1. Relative path from project_root_hint
+    2. Relative path from configured project_root
+    3. Git blob via commit_hash + path
+    4. Original absolute source (diagnostic only)
+    """
+    locator_type = ev.get("locator_type", "absolute")
+    path = ev.get("path") or ev.get("source", "")
+    commit_hash = ev.get("commit_hash")
+    
+    # git_blob type
+    if locator_type == "git_blob" and commit_hash and path:
+        return f"git:{commit_hash}:{path}", "reachable"
+    
+    # project_relative type
+    if locator_type == "project_relative" and path:
+        # Try project_root_hint first
+        hint = ev.get("project_root_hint")
+        if hint:
+            candidate = Path(hint) / path
+            if candidate.exists():
+                return str(candidate), "reachable"
+        
+        # Try configured project_root
+        if project_root:
+            candidate = project_root / path
+            if candidate.exists():
+                return str(candidate), "reachable"
+        
+        # Fall back to source for diagnosis
+        return path, "moved"
+    
+    # absolute or unknown - check if exists
+    if path:
+        abs_path = Path(path)
+        if abs_path.exists():
+            return str(abs_path), "reachable"
+        return path, "missing"
+    
+    return path or ev.get("source", "unknown"), "unknown"
+
+
+def check_evidence_health(conn: sqlite3.Connection, project_id: str) -> list[dict[str, Any]]:
+    """Check health of all evidence in a project."""
+    evidences = list_evidence(conn, project_id=project_id, limit=1000)
+    results = []
+    for ev in evidences:
+        resolved_path, status = resolve_evidence_path(ev)
+        results.append({
+            "id": ev["id"],
+            "type": ev["type"],
+            "source": ev["source"],
+            "locator_type": ev.get("locator_type", "absolute"),
+            "path": ev.get("path"),
+            "resolved_path": resolved_path,
+            "health": status,
+            "commit_hash": ev.get("commit_hash"),
+        })
+    return results
 
 
 PROPOSAL_PREFIX = "P"
@@ -335,7 +435,7 @@ def list_proposals(conn: sqlite3.Connection, project_id: str | None = None, stat
     return [_row_to_proposal(r) for r in cur.fetchall()]
 
 
-def update_proposal(conn: sqlite3.Connection, proposal_id: str, status: str, reviewer: str | None = None, reason: str | None = None, superseded_by: str | None = None, project_id: str | None = None) -> None:
+def update_proposal(conn: sqlite3.Connection, proposal_id: str, status: str, reviewer: str | None = None, reason: str | None = None, superseded_by: str | None = None, project_id: str | None = None, expected_revision: int | None = None) -> None:
     q = "SELECT * FROM proposals WHERE id=?"
     params: list[Any] = [proposal_id]
     if project_id:
@@ -347,8 +447,15 @@ def update_proposal(conn: sqlite3.Connection, proposal_id: str, status: str, rev
         raise KeyError(f"proposal not found: {proposal_id}")
     if row["status"] == "approved":
         raise ValueError(f"proposal {proposal_id} already approved, cannot re-apply")
+    # Optimistic lock check
+    current_revision = row["revision"] if "revision" in row.keys() else 1
+    if expected_revision is not None and current_revision != expected_revision:
+        raise ConflictError(
+            f"proposal {proposal_id} has been modified (revision {current_revision}, expected {expected_revision})"
+        )
     ts = now_iso()
-    conn.execute("UPDATE proposals SET status=?, reviewed_at=?, reviewer=?, superseded_by=? WHERE id=?", (status, ts, reviewer, superseded_by, proposal_id))
+    new_revision = current_revision + 1
+    conn.execute("UPDATE proposals SET status=?, reviewed_at=?, reviewer=?, superseded_by=?, revision=? WHERE id=?", (status, ts, reviewer, superseded_by, new_revision, proposal_id))
 
 
 def create_snapshot(conn: sqlite3.Connection, project_id: str, model_json: dict[str, Any], source_ids: list[str], basis_commit: str | None = None, basis_branch: str | None = None, confidence: float | None = None, curator_version: str = "rule-v1", snapshot_id: str | None = None) -> str:
@@ -586,35 +693,51 @@ def fts_search(
     query: str,
     limit: int = 20,
     project_id: str | None = None,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """FTS search with project isolation and observability metrics."""
+    import time
+    start = time.time()
+    
     if not query or not query.strip():
-        return []
+        return [], {"candidate_count": 0, "filtered_count": 0, "elapsed_ms": 0}
+    
     fts_rows: list[dict[str, Any]] = []
+    metrics = {"candidate_count": 0, "filtered_count": 0, "elapsed_ms": 0}
+    
     try:
+        # Query with project_id filtering in FTS
         cur = conn.execute(
-            "SELECT m.* FROM memory_fts f JOIN memories m ON m.id=f.id WHERE memory_fts MATCH ? ORDER BY rank LIMIT ?",
-            (query, limit * 3),
+            "SELECT m.* FROM memory_fts f JOIN memories m ON m.id=f.id "
+            "WHERE f.project_id=? AND memory_fts MATCH ? ORDER BY rank LIMIT ?",
+            (project_id or "default", query, limit * 3),
         )
         fts_rows = [_row_to_memory(r) for r in cur.fetchall()]
+        metrics["candidate_count"] = len(fts_rows)
     except sqlite3.OperationalError:
         pass
+    
+    # Fallback: query without project filter, then filter in Python
     if not fts_rows:
         try:
             cur = conn.execute(
-                "SELECT m.* FROM memory_fts f JOIN memories m ON m.id=f.id WHERE memory_fts MATCH ? LIMIT ?",
+                "SELECT m.* FROM memory_fts f JOIN memories m ON m.id=f.id "
+                "WHERE memory_fts MATCH ? LIMIT ?",
                 (query, limit * 3),
             )
             fts_rows = [_row_to_memory(r) for r in cur.fetchall()]
+            metrics["candidate_count"] = len(fts_rows)
+            
+            # Apply project filter
+            if project_id:
+                fts_rows = [r for r in fts_rows if r.get("project_id") == project_id]
+                metrics["filtered_count"] = metrics["candidate_count"] - len(fts_rows)
         except sqlite3.OperationalError:
             pass
-    if fts_rows:
-        if project_id:
-            filtered = [r for r in fts_rows if r.get("project_id") == project_id]
-            if filtered:
-                return filtered[:limit]
-            return _like_fallback(conn, query, limit, project_id=project_id)
-        return fts_rows[:limit]
-    return _like_fallback(conn, query, limit, project_id=project_id)
+    
+    elapsed_ms = int((time.time() - start) * 1000)
+    metrics["elapsed_ms"] = elapsed_ms
+    
+    return fts_rows, metrics
 
 
 def count_memories(conn: sqlite3.Connection, project_id: str | None = None) -> int:

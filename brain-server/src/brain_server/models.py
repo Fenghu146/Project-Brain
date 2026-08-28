@@ -68,6 +68,7 @@ class BrainRecordResponse(BaseModel):
     state_updates: list[str] = Field(default_factory=list)
     duplicate_of: list[dict[str, Any]] = Field(default_factory=list)
     conflicts: list[dict[str, Any]] = Field(default_factory=list)
+    schema_version: str = "4"
 
 
 class BrainAskRequest(BaseModel):
@@ -94,6 +95,7 @@ class BrainAskResponse(BaseModel):
     proposals: list[dict[str, Any]] = Field(default_factory=list)
     stale_facts: list[dict[str, Any]] = Field(default_factory=list)
     suggestions: list[str] = Field(default_factory=list)
+    schema_version: str = "4"
 
 
 class BrainOnboardRequest(BaseModel):
@@ -116,6 +118,7 @@ class BrainOnboardResponse(BaseModel):
     verification_suggestions: list[str] = Field(default_factory=list)
     basis_commit: str | None = None
     confidence: float | None = None
+    schema_version: str = "4"
 
 
 class BrainHandoverRequest(BaseModel):
@@ -140,6 +143,7 @@ class BrainHandoverResponse(BaseModel):
     verification_suggestions: list[str] = Field(default_factory=list)
     basis_commit: str | None = None
     model_snapshot_id: str | None = None
+    schema_version: str = "4"
 
 
 class ProposalAction(str):
@@ -211,6 +215,11 @@ def content_to_text(content: dict[str, Any] | str) -> str:
     if isinstance(content, str):
         return content
     return json.dumps(content, ensure_ascii=False)
+
+
+class ConflictError(Exception):
+    """Raised when optimistic lock conflict detected."""
+    pass
 
 
 def validate_memory_type(t: str) -> str:

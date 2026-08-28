@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS memories (
   commit_hash TEXT,
   verification_due_at TEXT,
   origin TEXT DEFAULT 'user',
-  superseded_by TEXT
+  superseded_by TEXT,
+  revision INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS evidence (
@@ -40,7 +41,11 @@ CREATE TABLE IF NOT EXISTS evidence (
   status TEXT NOT NULL DEFAULT 'observed',
   created_at TEXT NOT NULL,
   commit_hash TEXT,
-  branch TEXT
+  branch TEXT,
+  locator_type TEXT DEFAULT 'absolute',
+  path TEXT,
+  project_root_hint TEXT,
+  content_hash TEXT
 );
 
 CREATE TABLE IF NOT EXISTS links (
@@ -74,7 +79,8 @@ CREATE TABLE IF NOT EXISTS handovers (
   session_id TEXT,
   status TEXT NOT NULL,
   report_json TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -85,6 +91,7 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
   id UNINDEXED,
   type UNINDEXED,
+  project_id UNINDEXED,
   text
 );
 
@@ -120,7 +127,8 @@ CREATE TABLE IF NOT EXISTS proposals (
   created_at TEXT NOT NULL,
   reviewed_at TEXT,
   reviewer TEXT,
-  superseded_by TEXT
+  superseded_by TEXT,
+  revision INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS model_snapshots (
@@ -181,6 +189,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         ("verification_due_at", "verification_due_at TEXT"),
         ("origin", "origin TEXT DEFAULT 'user'"),
         ("superseded_by", "superseded_by TEXT"),
+        ("revision", "revision INTEGER NOT NULL DEFAULT 1"),
     ]:
         _ensure_column(conn, "memories", col, ddl)
     for col, ddl in [
@@ -189,15 +198,26 @@ def migrate(conn: sqlite3.Connection) -> None:
         ("result", "result TEXT"),
     ]:
         _ensure_column(conn, "events", col, ddl)
-    for col, ddl in [("commit_hash", "commit_hash TEXT"), ("branch", "branch TEXT")]:
+    for col, ddl in [
+        ("commit_hash", "commit_hash TEXT"),
+        ("branch", "branch TEXT"),
+        ("locator_type", "locator_type TEXT DEFAULT 'absolute'"),
+        ("path", "path TEXT"),
+        ("project_root_hint", "project_root_hint TEXT"),
+        ("content_hash", "content_hash TEXT"),
+    ]:
         _ensure_column(conn, "evidence", col, ddl)
     conn.execute("CREATE TABLE IF NOT EXISTS schema_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS proposals (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, action TEXT NOT NULL, target_type TEXT, target_id TEXT, payload_json TEXT NOT NULL, reason TEXT NOT NULL, source_event_ids TEXT NOT NULL, source_evidence_ids TEXT, affected_ids TEXT, risk TEXT, verification_suggestion TEXT, confidence REAL, curator_version TEXT NOT NULL, origin TEXT NOT NULL DEFAULT 'rule_curator', status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, reviewed_at TEXT, reviewer TEXT, superseded_by TEXT)"
+        "CREATE TABLE IF NOT EXISTS proposals (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, action TEXT NOT NULL, target_type TEXT, target_id TEXT, payload_json TEXT NOT NULL, reason TEXT NOT NULL, source_event_ids TEXT NOT NULL, source_evidence_ids TEXT, affected_ids TEXT, risk TEXT, verification_suggestion TEXT, confidence REAL, curator_version TEXT NOT NULL, origin TEXT NOT NULL DEFAULT 'rule_curator', status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, reviewed_at TEXT, reviewer TEXT, superseded_by TEXT, revision INTEGER NOT NULL DEFAULT 1)"
     )
     conn.execute(
         "CREATE TABLE IF NOT EXISTS model_snapshots (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, basis_commit TEXT, basis_branch TEXT, generated_at TEXT NOT NULL, model_json TEXT NOT NULL, source_ids TEXT NOT NULL, confidence REAL, curator_version TEXT NOT NULL)"
     )
+    # Add revision columns for concurrency control
+    _ensure_column(conn, "memories", "revision", "revision INTEGER NOT NULL DEFAULT 1")
+    _ensure_column(conn, "proposals", "revision", "revision INTEGER NOT NULL DEFAULT 1")
+    _ensure_column(conn, "handovers", "revision", "revision INTEGER NOT NULL DEFAULT 1")
     cur = conn.execute("SELECT v FROM schema_meta WHERE k='version'")
     row = cur.fetchone()
     if row is None:
@@ -213,7 +233,9 @@ def migrate(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_proposals_project_status ON proposals(project_id, status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_project_time ON model_snapshots(project_id, generated_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_dedup ON events(project_id, dedup_key)")
-    conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(id UNINDEXED, type UNINDEXED, text)")
+    # 确保 memory_fts 有 project_id 列
+    _ensure_column(conn, "memory_fts", "project_id", "project_id TEXT")
+    conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(id UNINDEXED, type UNINDEXED, project_id UNINDEXED, text)")
 
 
 def backfill_project_id(conn: sqlite3.Connection, project_id: str) -> int:

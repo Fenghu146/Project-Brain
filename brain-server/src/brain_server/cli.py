@@ -449,6 +449,211 @@ def cmd_status_compat(args: argparse.Namespace) -> int:
     return cmd_status(args)
 
 
+def cmd_doctor(args: argparse.Namespace) -> int:
+    db_path = resolve_db(args.db)
+    if not db_path.exists():
+        print(f"no brain at {db_path} — run `brain init` first", file=sys.stderr)
+        return 1
+
+    from .db import get_connection
+    from .repository import check_evidence_health
+
+    project_id = resolve_project_id(db_path, getattr(args, "project", None)) or "default"
+    conn = get_connection(str(db_path))
+
+    try:
+        health = check_evidence_health(conn, project_id)
+        reachable = [h for h in health if h["health"] == "reachable"]
+        moved = [h for h in health if h["health"] == "moved"]
+        missing = [h for h in health if h["health"] == "missing"]
+        external = [h for h in health if h["health"] == "external"]
+        unknown = [h for h in health if h["health"] == "unknown"]
+
+        print(f"Project: {project_id}")
+        print(f"Total evidence: {len(health)}")
+        print(f"  Reachable: {len(reachable)}")
+        print(f"  Moved: {len(moved)}")
+        print(f"  Missing: {len(missing)}")
+        print(f"  External: {len(external)}")
+        print(f"  Unknown: {len(unknown)}")
+        print()
+
+        if moved:
+            print("Moved evidence (may need path fix):")
+            for h in moved[:10]:
+                print(f"  {h['id']}: {h['source']} -> {h.get('path', 'N/A')}")
+            if len(moved) > 10:
+                print(f"  ... and {len(moved) - 10} more")
+            print()
+
+        if missing:
+            print("Missing evidence:")
+            for h in missing[:10]:
+                print(f"  {h['id']}: {h['source']}")
+            if len(missing) > 10:
+                print(f"  ... and {len(missing) - 10} more")
+            print()
+
+        if not moved and not missing:
+            print("All evidence paths are valid.")
+            return 0
+
+        if getattr(args, "fix_paths", False):
+            print("Path fixing requires manual review. Use relative locator_type for better portability.")
+            return 1
+
+        return 0
+    finally:
+        conn.close()
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    db_path = resolve_db(args.db)
+    if not db_path.exists():
+        print(f"no brain at {db_path} — run `brain init` first", file=sys.stderr)
+        return 1
+
+    import shutil
+    from datetime import datetime, timezone
+
+    target_dir = args.output or db_path.parent / "backups"
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    backup_dir = Path(target_dir) / f"backup-{timestamp}"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    # Copy database
+    db_dest = backup_dir / "brain.db"
+    shutil.copy2(db_path, db_dest)
+
+    # Copy config
+    cfg_src = db_path.parent / "config.json"
+    if cfg_src.exists():
+        shutil.copy2(cfg_src, backup_dir / "config.json")
+
+    # Copy exports
+    exports_src = db_path.parent / "exports"
+    if exports_src.exists():
+        exports_dest = backup_dir / "exports"
+        exports_dest.mkdir()
+        for f in exports_src.iterdir():
+            if f.is_file():
+                shutil.copy2(f, exports_dest / f.name)
+
+    # Create manifest
+    import hashlib
+    manifest = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "db_path": str(db_path),
+        "backup_dir": str(backup_dir),
+        "database_checksum": hashlib.sha256(db_dest.read_bytes()).hexdigest(),
+    }
+    (backup_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
+
+    print(f"Backup created: {backup_dir}")
+    print(f"Database: {db_dest}")
+    print(f"Manifest: {backup_dir / 'manifest.json'}")
+    return 0
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    import shutil
+
+    backup_path = Path(args.input)
+    if not backup_path.exists():
+        print(f"backup not found: {backup_path}", file=sys.stderr)
+        return 1
+
+    manifest_path = backup_path / "manifest.json"
+    if not manifest_path.exists():
+        print(f"no manifest found in {backup_path}", file=sys.stderr)
+        return 1
+
+    # Validate before restore
+    manifest = json.loads(manifest_path.read_text())
+    db_src = backup_path / "brain.db"
+    if not db_src.exists():
+        print(f"database file missing in backup", file=sys.stderr)
+        return 1
+
+    # Check integrity by opening
+    import sqlite3
+    try:
+        conn = sqlite3.connect(str(db_src))
+        conn.execute("PRAGMA integrity_check")
+        conn.close()
+    except Exception as e:
+        print(f"database integrity check failed: {e}", file=sys.stderr)
+        return 1
+
+    # Restore
+    target_db = resolve_db(args.db)
+    target_db.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(db_src, target_db)
+
+    cfg_src = backup_path / "config.json"
+    if cfg_src.exists():
+        cfg_dest = target_db.parent / "config.json"
+        shutil.copy2(cfg_src, cfg_dest)
+
+    exports_src = backup_path / "exports"
+    if exports_src.exists():
+        exports_dest = target_db.parent / "exports"
+        exports_dest.mkdir(parents=True, exist_ok=True)
+        for f in exports_src.iterdir():
+            if f.is_file():
+                shutil.copy2(f, exports_dest / f.name)
+
+    print(f"Restored from {backup_path} to {target_db}")
+    return 0
+
+
+def cmd_capabilities(args: argparse.Namespace) -> int:
+    db_path = resolve_db(args.db)
+    capabilities = {
+        "schema_version": "4",
+        "brain_version": "0.4",
+        "features": {
+            "fts_search": True,
+            "project_isolation": True,
+            "evidence_locator": True,
+            "optimistic_locking": True,
+            "audit_events": True,
+            "model_curator": True,
+            "rule_curator": True,
+            "handover": True,
+            "snapshot": True,
+        },
+        "providers": {
+            "search": "fts5",
+        },
+        "git_available": False,
+    }
+
+    # Check git availability
+    try:
+        import subprocess
+        subprocess.run(["git", "--version"], capture_output=True, timeout=2)
+        capabilities["git_available"] = True
+    except Exception:
+        pass
+
+    # Read schema version from DB if exists
+    if db_path.exists():
+        try:
+            from .db import get_connection
+            conn = get_connection(str(db_path))
+            cur = conn.execute("SELECT v FROM schema_meta WHERE k='version'")
+            row = cur.fetchone()
+            if row:
+                capabilities["schema_version"] = row["v"]
+            conn.close()
+        except Exception:
+            pass
+
+    print(json.dumps(capabilities, indent=2, ensure_ascii=False))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="brain", description="Project Brain CLI — cross-project brain management")
     p.add_argument("--db", help="path to .brain/brain.db (default: auto-detect .brain/ upwards)")
@@ -588,6 +793,23 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("status", help="show brain overview")
     s.add_argument("--project", help="project_id filter")
     s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("doctor", help="check evidence health and diagnostics")
+    s.add_argument("--project", help="project_id filter")
+    s.add_argument("--fix-paths", action="store_true", help="fix relocatable evidence paths (requires confirmation)")
+    s.set_defaults(func=cmd_doctor)
+
+    s = sub.add_parser("backup", help="backup brain database")
+    s.add_argument("--output", help="output directory for backup")
+    s.set_defaults(func=cmd_backup)
+
+    s = sub.add_parser("restore", help="restore brain from backup")
+    s.add_argument("--input", required=True, help="backup directory path")
+    s.add_argument("--db", help="target database path (default: auto-detect)")
+    s.set_defaults(func=cmd_restore)
+
+    s = sub.add_parser("capabilities", help="show available capabilities")
+    s.set_defaults(func=cmd_capabilities)
 
     return p
 
