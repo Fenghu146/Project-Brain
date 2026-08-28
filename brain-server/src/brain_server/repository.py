@@ -272,6 +272,38 @@ def get_handover(conn: sqlite3.Connection, handover_id: str) -> dict[str, Any] |
     }
 
 
+def _like_fallback(conn: sqlite3.Connection, query: str, limit: int) -> list[dict[str, Any]]:
+    raw = query.replace("？", " ").replace("?", " ").replace("，", " ").replace(",", " ").strip()
+    toks = [t for t in raw.split() if t.strip()]
+    if not toks:
+        toks = [raw]
+    candidates: list[str] = []
+    for t in toks:
+        candidates.append(t)
+        if len(t) > 4 and not t.isascii():
+            for i in range(len(t) - 1):
+                candidates.append(t[i : i + 2])
+    # de-dup while preserving order
+    seen_tok: set[str] = set()
+    uniq: list[str] = []
+    for c in candidates:
+        if c not in seen_tok and len(c) >= 2:
+            seen_tok.add(c)
+            uniq.append(c)
+    like_rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for tok in uniq[:8]:
+        cur = conn.execute("SELECT * FROM memories WHERE content_json LIKE ? OR tags LIKE ? LIMIT ?", (f"%{tok}%", f"%{tok}%", limit))
+        for r in cur.fetchall():
+            m = _row_to_memory(r)
+            if m["id"] not in seen:
+                seen.add(m["id"])
+                like_rows.append(m)
+        if len(like_rows) >= limit:
+            break
+    return like_rows[:limit]
+
+
 def fts_search(
     conn: sqlite3.Connection,
     query: str,
@@ -285,29 +317,21 @@ def fts_search(
             (query, limit),
         )
         rows = [_row_to_memory(r) for r in cur.fetchall()]
+        if rows:
+            return rows
     except sqlite3.OperationalError:
+        pass
+    try:
         cur = conn.execute(
             "SELECT m.* FROM memory_fts f JOIN memories m ON m.id=f.id WHERE memory_fts MATCH ? LIMIT ?",
             (query, limit),
         )
         rows = [_row_to_memory(r) for r in cur.fetchall()]
-    if rows:
-        return rows
-    toks = [t for t in query.replace("？", " ").replace("?", " ").replace("，", " ").replace(",", " ").split() if t.strip()]
-    if not toks:
-        toks = [query.strip()]
-    like_rows: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for tok in toks[:4]:
-        cur = conn.execute("SELECT * FROM memories WHERE content_json LIKE ? OR tags LIKE ? LIMIT ?", (f"%{tok}%", f"%{tok}%", limit))
-        for r in cur.fetchall():
-            m = _row_to_memory(r)
-            if m["id"] not in seen:
-                seen.add(m["id"])
-                like_rows.append(m)
-        if len(like_rows) >= limit:
-            break
-    return like_rows[:limit]
+        if rows:
+            return rows
+    except sqlite3.OperationalError:
+        pass
+    return _like_fallback(conn, query, limit)
 
 
 def count_memories(conn: sqlite3.Connection) -> int:

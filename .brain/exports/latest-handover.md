@@ -2,21 +2,26 @@
 
 - Task: T-001
 - Status: partial
-- Agent: agent-a
-- Session: session-12
+- Agent: manager
+- Session: manage-01
 
 ## Completed
-- 完成硬件连续帧压力测试
-- 记录测试日志
+- 以当前项目为对象重建 Brain
+- 写入决策/经验/知识与证据
+- 验证 onboard/ask 检索
 
 ## Discovered
-- 当前测试条件下未复现丢包
+- FTS5 对中文长句天然失效，已补 LIKE bigram 回退
 
 ## Remaining
-- 补充更高负载测试
-- 确认 cache coherency 风险
+- 验证 handover 后的 onboard 继承
+- 补充测试并整理 README
 
 ## Next Step
-由下一个 Agent 检查 cache coherency 并运行扩展压力测试
+由下一 Agent 验证继承并补充测试
 
-_Generated at 2026-08-28T04:53:42.923851+00:00_
+## Evidence
+- E-001
+- E-003
+
+_Generated at 2026-08-28T05:02:32.252939+00:00_
