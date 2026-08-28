@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 MemoryType = Literal["identity", "state", "knowledge", "experience", "decision", "task"]
 MemoryStatus = Literal["draft", "proposed", "observed", "verified", "active", "deprecated", "invalid"]
+TaskStatus = Literal["draft", "in_progress", "blocked", "completed", "cancelled"]
 EvidenceType = Literal["test_result", "log", "file", "commit", "user_confirmation", "observed"]
 EvidenceStatus = Literal["observed", "verified", "invalid"]
 EventAction = Literal["modify_file", "run_test", "record", "handover", "onboard", "create", "update"]
@@ -28,6 +29,7 @@ HANDOVER_PREFIX = "H"
 
 VALID_MEMORY_TYPES = set(MEMORY_PREFIX.keys())
 VALID_MEMORY_STATUSES = {"draft", "proposed", "observed", "verified", "active", "deprecated", "invalid"}
+VALID_TASK_STATUSES = {"draft", "in_progress", "blocked", "completed", "cancelled"}
 
 
 def now_iso() -> str:
@@ -38,9 +40,11 @@ class RecordInput(BaseModel):
     type: str
     content: dict[str, Any] | str
     status: str | None = None
+    task_status: str | None = None
     confidence: float | None = None
     tags: list[str] | None = None
     evidence: list[dict[str, Any]] | None = None
+    evidence_ids: list[str] | None = None
 
 
 class BrainRecordRequest(BaseModel):
@@ -56,6 +60,8 @@ class BrainRecordResponse(BaseModel):
     needs_verification: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     state_updates: list[str] = Field(default_factory=list)
+    duplicate_of: list[dict[str, Any]] = Field(default_factory=list)
+    conflicts: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class BrainAskRequest(BaseModel):
@@ -74,6 +80,8 @@ class BrainAskResponse(BaseModel):
     evidence: list[dict[str, Any]] = Field(default_factory=list)
     uncertainties: list[str] = Field(default_factory=list)
     confidence: float | None = None
+    match_mode: str = "none"
+    matches: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class BrainOnboardRequest(BaseModel):
@@ -89,6 +97,8 @@ class BrainOnboardResponse(BaseModel):
     generated_at: str
     brief: dict[str, Any]
     source_ids: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    missing_context: list[str] = Field(default_factory=list)
     confidence: float | None = None
 
 

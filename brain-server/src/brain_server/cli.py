@@ -121,11 +121,111 @@ def cmd_record(args: argparse.Namespace) -> int:
             content = args.content
         tags = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else None
         evidence = json.loads(args.evidence) if args.evidence else None
-        records.append(RecordInput(type=args.type, content=content, status=args.status, confidence=args.confidence, tags=tags, evidence=evidence))
+        evidence_ids = [s.strip() for s in args.evidence_ids.split(",") if s.strip()] if getattr(args, "evidence_ids", None) else None
+        records.append(RecordInput(type=args.type, content=content, status=args.status, task_status=getattr(args, "task_status", None), confidence=args.confidence, tags=tags, evidence=evidence, evidence_ids=evidence_ids))
 
     req = BrainRecordRequest(project_id=project_id, agent_id=args.agent, session_id=args.session, records=records)
     resp = brain_record(req, db_path=str(db_path))
     print(json.dumps(resp.model_dump(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    from .db import get_connection
+    from .repository import update_memory, get_memory
+
+    db_path = resolve_db(args.db)
+    project_id = resolve_project_id(db_path, args.project)
+    if not project_id:
+        print("error: --project is required", file=sys.stderr)
+        return 2
+    conn = get_connection(str(db_path))
+    try:
+        mem = get_memory(conn, args.id, project_id=project_id)
+        if mem is None:
+            print(f"not found: {args.id} in {project_id}", file=sys.stderr)
+            return 1
+        new_status = "verified" if args.action == "verify" else "invalid"
+        update_memory(conn, args.id, status=new_status, project_id=project_id)
+        conn.commit()
+        print(json.dumps({"id": args.id, "status": new_status}, ensure_ascii=False, indent=2))
+    finally:
+        conn.close()
+    return 0
+
+
+def cmd_link(args: argparse.Namespace) -> int:
+    from .db import get_connection
+    from .repository import create_link
+
+    db_path = resolve_db(args.db)
+    project_id = resolve_project_id(db_path, args.project)
+    if not project_id:
+        print("error: --project is required", file=sys.stderr)
+        return 2
+    conn = get_connection(str(db_path))
+    try:
+        create_link(conn, args.from_id, args.relation, args.to_id, project_id=project_id)
+        conn.commit()
+        print(json.dumps({"from": args.from_id, "relation": args.relation, "to": args.to_id, "project_id": project_id}, ensure_ascii=False, indent=2))
+    finally:
+        conn.close()
+    return 0
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    from .db import get_connection
+    import json as _json
+
+    db_path = resolve_db(args.db)
+    project_id = resolve_project_id(db_path, args.project) if getattr(args, "project", None) else None
+    conn = get_connection(str(db_path))
+    try:
+        out: dict = {}
+        if args.what in ("all", "memories"):
+            q = "SELECT * FROM memories"
+            params: list = []
+            if project_id:
+                q += " WHERE project_id=?"
+                params.append(project_id)
+            out["memories"] = [dict(r) for r in conn.execute(q, params).fetchall()]
+        if args.what in ("all", "evidence"):
+            q = "SELECT * FROM evidence"
+            params = []
+            if project_id:
+                q += " WHERE project_id=?"
+                params.append(project_id)
+            out["evidence"] = [dict(r) for r in conn.execute(q, params).fetchall()]
+        if args.what in ("all", "links"):
+            q = "SELECT * FROM links"
+            params = []
+            if project_id:
+                q += " WHERE project_id=?"
+                params.append(project_id)
+            out["links"] = [dict(r) for r in conn.execute(q, params).fetchall()]
+        if args.what in ("all", "events"):
+            q = "SELECT * FROM events"
+            params = []
+            if project_id:
+                q += " WHERE project_id=?"
+                params.append(project_id)
+            out["events"] = [dict(r) for r in conn.execute(q, params).fetchall()]
+        if args.what in ("all", "handovers"):
+            q = "SELECT * FROM handovers"
+            params = []
+            if project_id:
+                q += " WHERE project_id=?"
+                params.append(project_id)
+            out["handovers"] = [dict(r) for r in conn.execute(q, params).fetchall()]
+        dest = Path(args.out) if args.out else None
+        txt = _json.dumps(out, ensure_ascii=False, indent=2)
+        if dest:
+            dest.write_text(txt, encoding="utf-8")
+            print(f"exported to {dest}")
+        else:
+            print(txt)
+    finally:
+        conn.close()
     return 0
 
 
@@ -177,36 +277,44 @@ def cmd_handover(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    import sqlite3
-
     db_path = resolve_db(args.db)
     if not db_path.exists():
         print(f"no brain at {db_path} — run `brain init` first", file=sys.stderr)
         return 1
     from .db import get_connection
 
+    project_id = resolve_project_id(db_path, getattr(args, "project", None))
     conn = get_connection(str(db_path))
-    cur = conn.execute("SELECT type, status, count(*) as c FROM memories GROUP BY type, status ORDER BY type")
+    where = " WHERE project_id=?" if project_id else ""
+    params: list[str] = [project_id] if project_id else []
+    cur = conn.execute(f"SELECT type, status, task_status, count(*) as c FROM memories{where} GROUP BY type, status, task_status ORDER BY type", params)
     rows = cur.fetchall()
     print(f"DB: {db_path}")
     cfg = db_path.parent / "config.json"
     if cfg.exists():
         print(f"Config: {cfg.read_text(encoding='utf-8')}")
+    if project_id:
+        print(f"Project filter: {project_id}")
     print("Memories:")
     for r in rows:
-        print(f"  {r['type']:12} {r['status']:10} {r['c']}")
-    cur = conn.execute("SELECT count(*) as c FROM evidence")
-    print(f"Evidence: {cur.fetchone()['c']}")
-    cur = conn.execute("SELECT count(*) as c FROM handovers")
-    print(f"Handovers: {cur.fetchone()['c']}")
-    cur = conn.execute("SELECT count(*) as c FROM events")
-    print(f"Events: {cur.fetchone()['c']}")
+        ts = f" task_status={r['task_status']}" if r["task_status"] else ""
+        print(f"  {r['type']:12} {r['status']:10}{ts}  {r['c']}")
+    ev_q = "SELECT count(*) as c FROM evidence" + where
+    print(f"Evidence: {conn.execute(ev_q, params).fetchone()['c']}")
+    ho_q = "SELECT count(*) as c FROM handovers" + where
+    print(f"Handovers: {conn.execute(ho_q, params).fetchone()['c']}")
+    ev2_q = "SELECT count(*) as c FROM events" + where
+    print(f"Events: {conn.execute(ev2_q, params).fetchone()['c']}")
     md = db_path.parent / "exports" / "latest-handover.md"
     if md.exists():
         print(f"Latest handover: {md}")
         print(md.read_text(encoding="utf-8")[:800])
     conn.close()
     return 0
+
+
+def cmd_status_compat(args: argparse.Namespace) -> int:
+    return cmd_status(args)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -246,11 +354,32 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--type", dest="type", help="record type: identity/state/knowledge/experience/decision/task/evidence/event")
     s.add_argument("--content", help="JSON string or plain text content")
     s.add_argument("--status", help="status, e.g. active/verified/proposed")
+    s.add_argument("--task-status", help="task_status for tasks: draft/in_progress/blocked/completed/cancelled")
     s.add_argument("--tags", help="comma-separated tags")
     s.add_argument("--evidence", help="JSON array of evidence objects")
+    s.add_argument("--evidence-ids", help="comma-separated evidence ids to link")
     s.add_argument("--confidence", type=float, help="confidence 0-1")
     s.add_argument("--file", help="JSON file containing records array")
     s.set_defaults(func=cmd_record)
+
+    s = sub.add_parser("verify", help="verify or invalidate a memory")
+    s.add_argument("--project", help="project_id")
+    s.add_argument("--id", required=True, help="memory id, e.g. D-001")
+    s.add_argument("--action", required=True, choices=["verify", "invalidate"])
+    s.set_defaults(func=cmd_verify)
+
+    s = sub.add_parser("link", help="create a relation between two ids")
+    s.add_argument("--project", help="project_id")
+    s.add_argument("--from-id", required=True)
+    s.add_argument("--relation", required=True, choices=["supports", "supersedes", "conflicts_with", "related_to", "evidence_of"])
+    s.add_argument("--to-id", required=True)
+    s.set_defaults(func=cmd_link)
+
+    s = sub.add_parser("export", help="export brain data as JSON")
+    s.add_argument("--project", help="project_id filter")
+    s.add_argument("--what", default="all", choices=["all", "memories", "evidence", "links", "events", "handovers"])
+    s.add_argument("--out", help="output file path (default: stdout)")
+    s.set_defaults(func=cmd_export)
 
     s = sub.add_parser("handover", help="create a handover report")
     s.add_argument("--project", help="project_id")
@@ -267,6 +396,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_handover)
 
     s = sub.add_parser("status", help="show brain overview")
+    s.add_argument("--project", help="project_id filter")
     s.set_defaults(func=cmd_status)
 
     return p
