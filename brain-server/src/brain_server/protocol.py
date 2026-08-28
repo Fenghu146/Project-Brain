@@ -333,24 +333,42 @@ def brain_ask(req: BrainAskRequest, db_path: str | Path | None = None) -> BrainA
             answer = "未找到相关记录。"
 
         uncertainties: list[str] = []
+        suggestions: list[str] = []
         if not results and not proposals_out:
             uncertainties.append("无匹配记录，建议检查关键词或补充记录。")
             if match_mode == "none":
                 uncertainties.append("检索未命中任何候选，已应用相关度阈值过滤低相关结果。")
+            # 添加相关建议
+            suggestions.append("尝试使用不同的关键词或同义词查询")
+            suggestions.append("使用 brain record --type knowledge --content '{\"content\":\"你的知识内容\"}' 补充相关知识")
+            suggestions.append("使用 brain record --type decision --content '{\"decision\":\"决策内容\",\"reason\":\"决策原因\"}' 记录重要决策")
+            # 检查是否有待审提案
+            all_props = repo.list_proposals(conn, project_id=pid, status="pending", limit=5)
+            if all_props:
+                suggestions.append(f"有 {len(all_props)} 条待审提案，使用 brain review-list 查看")
         else:
             has_unverified = any(r["status"] in ("draft", "proposed", "observed") for r in results)
             if has_unverified:
                 uncertainties.append("部分结果尚未验证，需进一步确认。")
+                suggestions.append("使用 brain verify --id <id> --action verify 验证重要记录")
             if not evidence_list and results:
                 uncertainties.append("相关记录缺少可验证证据。")
+                suggestions.append("使用 brain record --type evidence --content '{\"type\":\"test_result\",\"source\":\"测试文件路径\"}' 添加证据")
             low_scores = [m for m in matches if m["score"] < 0.22]
             if low_scores:
                 uncertainties.append(f"{len(low_scores)} 条结果相关度较低，仅作弱命中。")
+                suggestions.append("尝试更具体的关键词或使用 --scope 参数限定范围")
             if stale_facts:
                 uncertainties.append(f"{len(stale_facts)} 条记录已过期，已降级为 stale_fact。")
+                suggestions.append("使用 brain record 更新过期记录的状态或内容")
+        
+        # 确保即使没有特定建议，也提供一些通用建议
+        if not suggestions:
+            suggestions.append("使用 brain onboard 获取项目完整上下文")
+            suggestions.append("使用 brain status 查看项目整体状态")
 
         confidence = compute_confidence(results, len(evidence_list))
-        return BrainAskResponse(answer=answer, facts=facts, evidence=evidence_list, uncertainties=uncertainties, confidence=confidence, match_mode=match_mode, matches=matches, proposals=proposals_out, stale_facts=stale_facts)
+        return BrainAskResponse(answer=answer, facts=facts, evidence=evidence_list, uncertainties=uncertainties, confidence=confidence, match_mode=match_mode, matches=matches, proposals=proposals_out, stale_facts=stale_facts, suggestions=suggestions)
     finally:
         conn.close()
 
@@ -431,17 +449,25 @@ def brain_onboard(req: BrainOnboardRequest, db_path: str | Path | None = None) -
             brief["focus_matches"] = [{"id": r["id"], "type": r["type"], "status": r["status"], "task_status": r.get("task_status")} for r in focused]
 
         missing: list[str] = []
+        context_suggestions: list[str] = []
         if not identities:
             missing.append("identity")
+            context_suggestions.append("建议使用 brain record --type identity --content '{\"name\":\"项目名称\",\"purpose\":\"项目目的\"}' 添加项目身份")
         if not states:
             missing.append("state")
+            context_suggestions.append("建议使用 brain record --type state --content '{\"current_goal\":\"当前目标\",\"blockers\":[],\"open_questions\":[]}' 添加项目状态")
         if not tasks_all:
             missing.append("tasks")
+            context_suggestions.append("建议使用 brain record --type task --content '{\"title\":\"任务标题\",\"remaining\":[\"待办事项\"],\"next_step\":\"下一步\"}' 添加任务")
         if not decisions:
             missing.append("decisions")
+            context_suggestions.append("建议使用 brain record --type decision --content '{\"decision\":\"决策内容\",\"reason\":\"决策原因\"}' 添加重要决策")
         if not handovers:
             missing.append("handover")
+            context_suggestions.append("建议在工作交接时使用 brain handover 创建交接报告")
         brief["missing_context"] = missing
+        if context_suggestions:
+            brief["context_suggestions"] = context_suggestions
 
         source_ids: list[str] = []
         for lst in [identities, states, blocked_tasks, in_progress_tasks, important_decisions, known_failures, handovers]:

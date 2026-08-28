@@ -93,6 +93,7 @@ class BrainAskResponse(BaseModel):
     matches: list[dict[str, Any]] = Field(default_factory=list)
     proposals: list[dict[str, Any]] = Field(default_factory=list)
     stale_facts: list[dict[str, Any]] = Field(default_factory=list)
+    suggestions: list[str] = Field(default_factory=list)
 
 
 class BrainOnboardRequest(BaseModel):

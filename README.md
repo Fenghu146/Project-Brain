@@ -5,6 +5,7 @@
 - 规格：`project-brain-v0.1.md`（v0.1 MVP 工程方案）
 - 第二版方案：`project-brain-v0.2.md`（可靠记忆与项目隔离）
 - 第三版方案：`project-brain-v0.3.md`（主动认知与可审阅 Curator）
+- 第四版方案：`project-brain-v0.4.md`（可迁移、并发与可运营 Brain）
 - 计划：`.commandcode/plans/project-brain-v01-prototype-plan.md`
 
 ## 目录结构

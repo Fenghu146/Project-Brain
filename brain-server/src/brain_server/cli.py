@@ -31,6 +31,37 @@ def resolve_project_id(db_path: Path, explicit: str | None) -> str | None:
     return None
 
 
+def resolve_agent_id(explicit: str | None, db_path: Path | None = None) -> str:
+    """智能推断 agent_id，优先级：显式参数 > 环境变量 > 配置文件 > 默认值"""
+    if explicit:
+        return explicit
+    
+    # 尝试从环境变量读取
+    import os
+    env_agent = os.environ.get("BRAIN_AGENT_ID")
+    if env_agent:
+        return env_agent
+    
+    # 尝试从最近的 handover 或 session 推断
+    if db_path and db_path.exists():
+        try:
+            from .db import get_connection
+            conn = get_connection(str(db_path))
+            # 查询最近的 handover 中的 agent_id
+            recent_handover = conn.execute(
+                "SELECT agent_id FROM handovers ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            if recent_handover:
+                conn.close()
+                return recent_handover["agent_id"]
+            conn.close()
+        except Exception:
+            pass
+    
+    # 默认值
+    return "cli-user"
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     from datetime import datetime, timezone
 
@@ -75,7 +106,8 @@ def cmd_onboard(args: argparse.Namespace) -> int:
     if not project_id:
         print("error: --project is required (no config found)", file=sys.stderr)
         return 2
-    req = BrainOnboardRequest(project_id=project_id, agent_id=args.agent, session_id=args.session, focus=args.focus, token_budget=args.token_budget)
+    agent_id = resolve_agent_id(args.agent, db_path)
+    req = BrainOnboardRequest(project_id=project_id, agent_id=agent_id, session_id=args.session, focus=args.focus, token_budget=args.token_budget)
     resp = brain_onboard(req, db_path=str(db_path))
     print(json.dumps(resp.model_dump(), ensure_ascii=False, indent=2))
     return 0
@@ -89,8 +121,9 @@ def cmd_ask(args: argparse.Namespace) -> int:
     if not project_id:
         print("error: --project is required", file=sys.stderr)
         return 2
+    agent_id = resolve_agent_id(args.agent, db_path)
     scope = [s.strip() for s in args.scope.split(",") if s.strip()] if args.scope else None
-    req = BrainAskRequest(project_id=project_id, agent_id=args.agent, session_id=args.session, question=args.question, scope=scope, include_evidence=not args.no_evidence, limit=args.limit, include_proposals=bool(getattr(args, "include_proposals", False)), as_of_commit=getattr(args, "as_of_commit", None), as_of_time=getattr(args, "as_of_time", None))
+    req = BrainAskRequest(project_id=project_id, agent_id=agent_id, session_id=args.session, question=args.question, scope=scope, include_evidence=not args.no_evidence, limit=args.limit, include_proposals=bool(getattr(args, "include_proposals", False)), as_of_commit=getattr(args, "as_of_commit", None), as_of_time=getattr(args, "as_of_time", None))
     resp = brain_ask(req, db_path=str(db_path))
     print(json.dumps(resp.model_dump(), ensure_ascii=False, indent=2))
     return 0
@@ -104,6 +137,7 @@ def cmd_record(args: argparse.Namespace) -> int:
     if not project_id:
         print("error: --project is required", file=sys.stderr)
         return 2
+    agent_id = resolve_agent_id(args.agent, db_path)
 
     records: list[RecordInput] = []
     if args.file:
@@ -124,7 +158,7 @@ def cmd_record(args: argparse.Namespace) -> int:
         evidence_ids = [s.strip() for s in args.evidence_ids.split(",") if s.strip()] if getattr(args, "evidence_ids", None) else None
         records.append(RecordInput(type=args.type, content=content, status=args.status, task_status=getattr(args, "task_status", None), confidence=args.confidence, tags=tags, evidence=evidence, evidence_ids=evidence_ids, origin=getattr(args, "origin", None), valid_from=getattr(args, "valid_from", None), valid_until=getattr(args, "valid_until", None), branch=getattr(args, "branch", None), commit_hash=getattr(args, "commit_hash", None), verification_due_at=getattr(args, "verification_due_at", None)))
 
-    req = BrainRecordRequest(project_id=project_id, agent_id=args.agent, session_id=args.session, records=records)
+    req = BrainRecordRequest(project_id=project_id, agent_id=agent_id, session_id=args.session, records=records)
     resp = brain_record(req, db_path=str(db_path))
     print(json.dumps(resp.model_dump(), ensure_ascii=False, indent=2))
     return 0
@@ -334,6 +368,7 @@ def cmd_handover(args: argparse.Namespace) -> int:
     if not project_id:
         print("error: --project is required", file=sys.stderr)
         return 2
+    agent_id = resolve_agent_id(args.agent, db_path)
 
     def _list(v: str | None) -> list[str]:
         if not v:
@@ -354,7 +389,7 @@ def cmd_handover(args: argparse.Namespace) -> int:
 
     req = BrainHandoverRequest(
         project_id=project_id,
-        agent_id=args.agent,
+        agent_id=agent_id,
         session_id=args.session,
         task_id=args.task,
         status=args.status,  # type: ignore[arg-type]
@@ -428,7 +463,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("onboard", help="get onboarding brief for a new agent")
     s.add_argument("--project", help="project_id (default: from .brain/config.json)")
-    s.add_argument("--agent", required=True, help="agent_id")
+    s.add_argument("--agent", help="agent_id (default: auto-inferred from recent handover or 'cli-user')")
     s.add_argument("--session", help="session_id")
     s.add_argument("--focus", help="focus topic for contextual brief")
     s.add_argument("--token-budget", type=int, default=1800)
@@ -436,7 +471,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("ask", help="ask brain with natural language")
     s.add_argument("--project", help="project_id")
-    s.add_argument("--agent", required=True)
+    s.add_argument("--agent", help="agent_id (default: auto-inferred from recent handover or 'cli-user')")
     s.add_argument("--session", help="session_id")
     s.add_argument("--question", required=True, help="question text")
     s.add_argument("--scope", help="comma-separated scope filter, e.g. 'uart,dma'")
@@ -449,7 +484,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("record", help="record knowledge/experience/decision/task/evidence/event")
     s.add_argument("--project", help="project_id")
-    s.add_argument("--agent", required=True)
+    s.add_argument("--agent", help="agent_id (default: auto-inferred from recent handover or 'cli-user')")
     s.add_argument("--session", help="session_id")
     s.add_argument("--type", dest="type", help="record type: identity/state/knowledge/experience/decision/task/evidence/event")
     s.add_argument("--content", help="JSON string or plain text content")
@@ -538,7 +573,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("handover", help="create a handover report")
     s.add_argument("--project", help="project_id")
-    s.add_argument("--agent", required=True)
+    s.add_argument("--agent", help="agent_id (default: auto-inferred from recent handover or 'cli-user')")
     s.add_argument("--session", help="session_id")
     s.add_argument("--task", help="task_id, e.g. T-001")
     s.add_argument("--status", required=True, choices=["completed", "partial", "failed"])
