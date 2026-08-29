@@ -30,6 +30,7 @@ from .models import (
     now_iso,
 )
 from .search import compute_confidence, ranked_search
+from .answer_brain import AnswerBrain, answer_v2
 
 
 def ensure_db(db_path: str | Path | None = None) -> sqlite3.Connection:
@@ -338,11 +339,9 @@ def brain_ask(req: BrainAskRequest, db_path: str | Path | None = None) -> BrainA
             uncertainties.append("无匹配记录，建议检查关键词或补充记录。")
             if match_mode == "none":
                 uncertainties.append("检索未命中任何候选，已应用相关度阈值过滤低相关结果。")
-            # 添加相关建议
             suggestions.append("尝试使用不同的关键词或同义词查询")
             suggestions.append("使用 brain record --type knowledge --content '{\"content\":\"你的知识内容\"}' 补充相关知识")
             suggestions.append("使用 brain record --type decision --content '{\"decision\":\"决策内容\",\"reason\":\"决策原因\"}' 记录重要决策")
-            # 检查是否有待审提案
             all_props = repo.list_proposals(conn, project_id=pid, status="pending", limit=5)
             if all_props:
                 suggestions.append(f"有 {len(all_props)} 条待审提案，使用 brain review-list 查看")
@@ -362,7 +361,6 @@ def brain_ask(req: BrainAskRequest, db_path: str | Path | None = None) -> BrainA
                 uncertainties.append(f"{len(stale_facts)} 条记录已过期，已降级为 stale_fact。")
                 suggestions.append("使用 brain record 更新过期记录的状态或内容")
         
-        # 确保即使没有特定建议，也提供一些通用建议
         if not suggestions:
             suggestions.append("使用 brain onboard 获取项目完整上下文")
             suggestions.append("使用 brain status 查看项目整体状态")
@@ -371,6 +369,23 @@ def brain_ask(req: BrainAskRequest, db_path: str | Path | None = None) -> BrainA
         return BrainAskResponse(answer=answer, facts=facts, evidence=evidence_list, uncertainties=uncertainties, confidence=confidence, match_mode=match_mode, matches=matches, proposals=proposals_out, stale_facts=stale_facts, suggestions=suggestions)
     finally:
         conn.close()
+
+
+def brain_ask_v2(req: BrainAskRequest, db_path: str | Path | None = None) -> dict[str, Any]:
+    """v0.6 enhanced ask using AnswerBrain."""
+    result = answer_v2(
+        question=req.question,
+        project_id=req.project_id,
+        agent_id=req.agent_id,
+        session_id=req.session_id,
+        scope=req.scope,
+        limit=req.limit,
+        include_proposals=req.include_proposals,
+        as_of_commit=req.as_of_commit,
+        as_of_time=req.as_of_time,
+        db_path=db_path,
+    )
+    return result.model_dump(mode="json")
 
 
 def brain_onboard(req: BrainOnboardRequest, db_path: str | Path | None = None) -> BrainOnboardResponse:
@@ -383,7 +398,6 @@ def brain_onboard(req: BrainOnboardRequest, db_path: str | Path | None = None) -
         decisions = repo.list_memories(conn, project_id=pid, mem_type="decision", limit=5)
         experiences = repo.list_memories(conn, project_id=pid, mem_type="experience", limit=5)
         handovers = repo.list_handovers(conn, project_id=pid, limit=1)
-        # project model enrichment (best-effort, never fails onboard)
         pending_reviews = len(repo.list_proposals(conn, project_id=pid, status="pending", limit=100))
         snapshots = repo.list_snapshots(conn, project_id=pid, limit=1)
         basis_commit = snapshots[0].get("basis_commit") if snapshots else None
@@ -482,7 +496,6 @@ def brain_onboard(req: BrainOnboardRequest, db_path: str | Path | None = None) -
                 if lk["relation"] == "evidence_of" and lk["to_id"] not in evidence_ids:
                     evidence_ids.append(lk["to_id"])
 
-        # enrich brief with model/suggestions (not truncating them away unless needed)
         brief["pending_reviews"] = pending_reviews
         brief["stale_context"] = stale_context[:5] if stale_context else []
         brief["verification_suggestions"] = verification_suggestions
@@ -555,7 +568,6 @@ def brain_review_apply(req: BrainReviewApplyRequest, db_path: str | Path | None 
             raise ValueError("project_id mismatch")
         if prop["status"] == "approved":
             raise ValueError(f"proposal {req.proposal_id} already approved")
-        # validate sources still exist
         for eid in prop.get("source_event_ids", []):
             found = any(e["id"] == eid for e in repo.list_events(conn, project_id=pid, limit=200))
             if not found:
@@ -568,7 +580,6 @@ def brain_review_apply(req: BrainReviewApplyRequest, db_path: str | Path | None 
                 ev_id = repo.create_event(conn, project_id=pid, action="review", agent_id=req.reviewer, summary=f"review {req.proposal_id} superseded (target updated)", payload={"proposal_id": req.proposal_id, "action": "superseded"}, source="review", result="superseded")
                 conn.commit()
                 raise ValueError(f"target {target_id} changed after proposal, marked superseded; re-curate")
-        # apply
         new_status = req.action
         repo.update_proposal(conn, req.proposal_id, status=new_status, reviewer=req.reviewer, project_id=pid)
         applied_event_id = None
@@ -709,7 +720,6 @@ def brain_handover(req: BrainHandoverRequest, db_path: str | Path | None = None)
         for eid in req.evidence_ids:
             repo.create_link(conn, handover_id, "evidence_of", eid, project_id=pid)
 
-        # enrich handover with session events / pending / suggestions / basis
         session_event_ids = [e["id"] for e in repo.list_events(conn, project_id=pid, limit=100) if e.get("session_id") == req.session_id] if req.session_id else []
         pending_count = len(repo.list_proposals(conn, project_id=pid, status="pending", limit=100))
         verification_suggestions: list[str] = []
@@ -735,7 +745,6 @@ def brain_handover(req: BrainHandoverRequest, db_path: str | Path | None = None)
             model_snapshot_id = create_snapshot(conn, pid, basis_commit=basis_commit)
         except Exception:
             pass
-        # write back to report for provenance
         report["session_event_ids"] = session_event_ids
         report["pending_proposals_count"] = pending_count
         report["verification_suggestions"] = verification_suggestions

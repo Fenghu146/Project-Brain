@@ -7,6 +7,7 @@
 - 第三版方案：`project-brain-v0.3.md`（主动认知与可审阅 Curator）
 - 第四版方案：`project-brain-v0.4.md`（可迁移、并发与可运营 Brain）
 - 第五版方案：`project-brain-v0.5.md`（Workflow Brain 工作流嵌入层）
+- 第六版方案：`project-brain-v0.6.md`（Evidence-grounded Answer Brain）
 - 计划：`.commandcode/plans/project-brain-v01-prototype-plan.md`
 
 ## 目录结构
