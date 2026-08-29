@@ -388,6 +388,33 @@ def brain_ask_v2(req: BrainAskRequest, db_path: str | Path | None = None) -> dic
     return result.model_dump(mode="json")
 
 
+def brain_feedback(req, db_path: str | Path | None = None):  # type: ignore[no-untyped-def]
+    from .db import get_connection, init_db
+    import json as _json
+
+    conn = get_connection(db_path)
+    init_db(db_path)
+    try:
+        import uuid
+
+        fid = f"FB-{uuid.uuid4().hex[:8]}"
+        ts = now_iso()
+        conn.execute(
+            "INSERT INTO answer_feedback (id, project_id, question, answer_claim_ids, intent, confidence, verdict, corrected_text, agent_id, session_id, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (fid, req.project_id, req.question, _json.dumps(req.answer_claim_ids or [], ensure_ascii=False), req.intent, req.confidence, req.verdict, req.corrected_text, req.agent_id, req.session_id, ts),
+        )
+        # Also write an Event (feedback does not modify Memory)
+        from .repository import create_event
+
+        eid = create_event(conn, action="feedback", agent_id=req.agent_id, session_id=req.session_id, summary=f"feedback {req.verdict}: {req.question[:60]}", payload={"question": req.question, "verdict": req.verdict, "intent": req.intent, "feedback_id": fid}, project_id=req.project_id, source="feedback", result=req.verdict)
+        conn.commit()
+        from .models import BrainFeedbackResponse
+
+        return BrainFeedbackResponse(feedback_id=fid, event_id=eid)
+    finally:
+        conn.close()
+
+
 def brain_onboard(req: BrainOnboardRequest, db_path: str | Path | None = None) -> BrainOnboardResponse:
     conn = ensure_db(db_path)
     pid = req.project_id

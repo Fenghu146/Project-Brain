@@ -6,6 +6,9 @@ init:
 test:
 	python3 -m pytest brain-server/tests -v
 
+eval:
+	python3 brain-server/eval/runner.py
+
 demo:
 	python3 scripts/brain-demo.py
 

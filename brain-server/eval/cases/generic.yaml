@@ -1,0 +1,33 @@
+cases:
+  - id: irr-001
+    question: "今天天气怎么样"
+    project_id: project-brain
+    expected:
+      intent: generic_search
+      max_key_points: 1
+      min_confidence: 0.0
+      should_refuse: true
+  - id: irr-002
+    question: "量子纠缠是什么"
+    project_id: project-brain
+    expected:
+      intent: generic_search
+      should_refuse: true
+  - id: fuzzy-001
+    question: "怎么实现？"
+    project_id: project-brain
+    expected:
+      intent: generic_search
+      may_clarify: true
+  - id: fuzzy-002
+    question: "v0.6是什么"
+    project_id: project-brain
+    expected:
+      intent: generic_search
+      max_key_points: 6
+  - id: conf-001
+    question: "v0.4 包含哪些功能"
+    project_id: project-brain
+    expected:
+      intent: feature_summary
+      max_key_points: 6

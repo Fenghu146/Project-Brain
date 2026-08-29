@@ -38,7 +38,7 @@ QUESTION_TYPE_PATTERNS: list[tuple[str, list[str], dict[str, Any]]] = [
     # Mechanism explanation questions
     (
         "mechanism_explanation",
-        ["如何实现", "工作原理", "怎么工作", "机制是什么", "实现原理", "如何支持", "工作流", "工作流程", "方案", "怎么做", "怎样实现"],
+        ["如何实现", "工作原理", "怎么工作", "机制是什么", "实现原理", "如何支持", "工作流", "工作流程", "方案", "怎么做", "怎样实现", "如何工作"],
         {"preferred_types": ["knowledge", "decision", "evidence"], "exclude_types": [], "include_history": False, "prioritize_evidence": True, "default_length": "medium", "max_key_points": 5},
     ),
     # Decision reason questions
@@ -189,6 +189,26 @@ def classify_intent(question: str) -> tuple[IntentType, dict[str, Any]]:
         "default_length": "medium",
         "max_key_points": 5,  # limit for narrow mode
     }
+
+
+def score_intents(question: str) -> list[tuple[IntentType, float]]:
+    q_lower = question.lower()
+    scored: list[tuple[IntentType, float]] = []
+    for intent, keywords, _ in QUESTION_TYPE_PATTERNS:
+        hits = sum(1 for kw in keywords if kw in q_lower)
+        if hits:
+            scored.append((intent, float(hits)))
+    if not scored:
+        # check entity-only
+        has_entity = any(
+            any(kw.lower() in q_lower for kw in kws) for _, kws in ENTITY_PATTERNS
+        )
+        if has_entity:
+            scored.append(("generic_search", 0.3))
+        else:
+            scored.append(("generic_search", 0.1))
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored
 
 
 def get_source_policy(intent: IntentType) -> dict[str, Any]:

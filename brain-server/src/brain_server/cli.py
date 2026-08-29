@@ -496,6 +496,24 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
         if not moved and not missing:
             print("All evidence paths are valid.")
+
+        if getattr(args, "detail", False):
+            try:
+                from .health import brain_health
+
+                bh = brain_health(conn, project_id)
+                print("Brain Health")
+                print(f"├── Evidence health: {bh['evidence']['reachable']}/{bh['evidence']['total']} reachable")
+                mem_w = bh["memory"]["warnings"]
+                print(f"├── Memory health: {len(mem_w)} warnings")
+                for w in mem_w[:5]:
+                    print(f"│   - {w['kind']}: {w.get('id', w.get('ids',''))} {w.get('detail','')}")
+                print(f"├── Provenance coverage: {bh['provenance_coverage']}")
+                print(f"└── Workflow: {bh['workflow']['active_sessions']} active sessions")
+            except Exception as e:
+                print(f"(health detail unavailable: {e})")
+
+        if not moved and not missing and not getattr(args, "detail", False):
             return 0
 
         if getattr(args, "fix_paths", False):
@@ -725,6 +743,30 @@ def cmd_workflow(args: argparse.Namespace) -> int:
         return 2
 
 
+def cmd_feedback(args: argparse.Namespace) -> int:
+    from .models import BrainFeedbackRequest
+    from .protocol import brain_feedback
+
+    db_path = resolve_db(args.db)
+    project_id = resolve_project_id(db_path, args.project)
+    if not project_id:
+        print("error: --project is required", file=sys.stderr)
+        return 2
+    agent_id = resolve_agent_id(args.agent, db_path)
+    req = BrainFeedbackRequest(
+        project_id=project_id,
+        agent_id=agent_id,
+        session_id=getattr(args, "session", None),
+        question=args.question,
+        verdict=args.verdict,  # type: ignore[arg-type]
+        corrected_text=getattr(args, "corrected_text", None),
+        intent=getattr(args, "intent", None),
+    )
+    resp = brain_feedback(req, db_path=str(db_path))
+    print(json.dumps(resp.model_dump(), ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_capabilities(args: argparse.Namespace) -> int:
     db_path = resolve_db(args.db)
     capabilities = {
@@ -740,6 +782,11 @@ def cmd_capabilities(args: argparse.Namespace) -> int:
             "rule_curator": True,
             "handover": True,
             "snapshot": True,
+            "answer_claims": True,
+            "feedback": True,
+            "clustering": True,
+            "clarification": True,
+            "memory_health": True,
         },
         "providers": {
             "search": "fts5",
@@ -915,7 +962,18 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("doctor", help="check evidence health and diagnostics")
     s.add_argument("--project", help="project_id filter")
     s.add_argument("--fix-paths", action="store_true", help="fix relocatable evidence paths (requires confirmation)")
+    s.add_argument("--detail", action="store_true", help="show 5-layer brain health")
     s.set_defaults(func=cmd_doctor)
+
+    s = sub.add_parser("feedback", help="submit answer feedback (does not modify Memory)")
+    s.add_argument("--project", help="project_id")
+    s.add_argument("--agent", help="agent_id")
+    s.add_argument("--session", help="session_id")
+    s.add_argument("--question", required=True, help="original question")
+    s.add_argument("--verdict", required=True, choices=["accepted", "corrected", "expanded", "irrelevant", "missing_evidence"])
+    s.add_argument("--corrected-text", help="corrected answer when verdict=corrected")
+    s.add_argument("--intent", help="reported intent")
+    s.set_defaults(func=cmd_feedback)
 
     s = sub.add_parser("backup", help="backup brain database")
     s.add_argument("--output", help="output directory for backup")

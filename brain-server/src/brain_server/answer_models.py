@@ -70,6 +70,39 @@ class ConfidenceBreakdown(BaseModel):
         return round(max(0.0, min(1.0, base - self.conflict_penalty)), 2)
 
 
+class ClusterInfo(BaseModel):
+    cluster_id: str
+    primary_id: str
+    supporting_ids: list[str] = Field(default_factory=list)
+    merged_reason: str = ""
+
+
+class AnswerClaim(BaseModel):
+    text: str
+    key_point_ids: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    support: SupportLevel = "none"
+
+
+class Clarification(BaseModel):
+    needed: bool = False
+    prompt: str = ""
+    candidates: list[IntentType] = Field(default_factory=list)
+    threshold: float = 0.15
+
+
+def confidence_label(c: float) -> str:
+    if c >= 0.90:
+        return "可以直接作为工作上下文使用"
+    if c >= 0.70:
+        return "基本可靠，建议查看证据"
+    if c >= 0.40:
+        return "相关但不完整，需要谨慎"
+    if c > 0.0:
+        return "仅供线索，不应据此决策"
+    return "没有可靠答案"
+
+
 class KeyPoint(BaseModel):
     text: str
     source_ids: list[str] = Field(default_factory=list)
@@ -79,11 +112,11 @@ class KeyPoint(BaseModel):
     pollution_tags: list[PollutionTag] = Field(default_factory=list)
     is_stale: bool = False
     is_conflicted: bool = False
-    # P2: New fields for finer granularity
     freshness: FreshnessLevel = "current"
     evidence_coverage: float = 0.0
     why_included: str | None = None
     why_excluded: str | None = None
+    cluster: ClusterInfo | None = None
 
 
 class RelatedContext(BaseModel):
@@ -105,6 +138,9 @@ class AnswerResult(BaseModel):
     schema_version: str = "0.6"
     answer: str
     key_points: list[KeyPoint] = Field(default_factory=list)
+    answer_claims: list[AnswerClaim] = Field(default_factory=list)
+    hallucination_risk: bool = False
+    clarification: Clarification | None = None
     facts: list[dict[str, Any]] = Field(default_factory=list)
     evidence: list[dict[str, Any]] = Field(default_factory=list)
     related_context: list[RelatedContext] = Field(default_factory=list)
@@ -113,6 +149,7 @@ class AnswerResult(BaseModel):
     intent: IntentType = "generic_search"
     match_mode: str = "none"
     confidence: float = 0.0
+    confidence_label_text: str = ""
     confidence_breakdown: ConfidenceBreakdown = Field(default_factory=ConfidenceBreakdown)
     provenance: list[dict[str, Any]] = Field(default_factory=list)
     # v0.5 compat fields
@@ -120,9 +157,7 @@ class AnswerResult(BaseModel):
     suggestions: list[str] = Field(default_factory=list)
     matches: list[dict[str, Any]] = Field(default_factory=list)
     proposals: list[dict[str, Any]] = Field(default_factory=list)
-    # P1: Answer mode
     answer_mode: str = "standard"
-    # P0: Version metadata
     brain_runtime_version: str = "0.6"
     workflow_version: str = "0.5"
     answer_version: str = "0.6"

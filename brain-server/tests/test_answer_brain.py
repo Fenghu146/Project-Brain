@@ -120,9 +120,9 @@ def test_answer_filters_version_plan_pollution():
         assert result.schema_version == "0.6"
         # Should not include version_plan in main answer
         clean_points = [kp for kp in result.key_points if "version_plan" not in kp.pollution_tags]
-        # If only polluted points exist, answer should indicate this
+        # Refusal now returns the canonical "没有足够可靠" message; either form is acceptable
         if not clean_points:
-            assert "版本规划" in result.answer or "未找到" in result.answer
+            assert any(s in result.answer for s in ("版本规划", "未找到", "没有足够可靠"))
 
 
 def test_answer_with_evidence():

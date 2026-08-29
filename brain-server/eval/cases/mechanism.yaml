@@ -1,0 +1,26 @@
+cases:
+  - id: mech-001
+    question: "并发控制机制"
+    project_id: project-brain
+    expected:
+      intent: mechanism_explanation
+      max_key_points: 5
+      min_confidence: 0.3
+  - id: mech-002
+    question: "证据迁移方案"
+    project_id: project-brain
+    expected:
+      intent: mechanism_explanation
+      max_key_points: 5
+  - id: mech-003
+    question: "WorkflowBrain 如何实现"
+    project_id: project-brain
+    expected:
+      intent: mechanism_explanation
+      max_key_points: 5
+  - id: mech-004
+    question: "FTS 项目隔离如何工作"
+    project_id: project-brain
+    expected:
+      intent: mechanism_explanation
+      max_key_points: 5

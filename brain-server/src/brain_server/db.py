@@ -203,6 +203,23 @@ CREATE INDEX IF NOT EXISTS idx_automation_runs_project_session
   ON automation_runs(project_id, session_id);
 CREATE INDEX IF NOT EXISTS idx_handover_drafts_project_status
   ON handover_drafts(project_id, status);
+
+CREATE TABLE IF NOT EXISTS answer_feedback (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  question TEXT NOT NULL,
+  answer_claim_ids TEXT,
+  intent TEXT,
+  confidence REAL,
+  verdict TEXT NOT NULL,
+  corrected_text TEXT,
+  agent_id TEXT NOT NULL,
+  session_id TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_feedback_project_time
+  ON answer_feedback(project_id, created_at);
 """
 
 
@@ -297,6 +314,8 @@ def migrate(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_project_status ON sessions(project_id, status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_automation_runs_project_session ON automation_runs(project_id, session_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_handover_drafts_project_status ON handover_drafts(project_id, status)")
+    conn.execute("CREATE TABLE IF NOT EXISTS answer_feedback (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, question TEXT NOT NULL, answer_claim_ids TEXT, intent TEXT, confidence REAL, verdict TEXT NOT NULL, corrected_text TEXT, agent_id TEXT NOT NULL, session_id TEXT, created_at TEXT NOT NULL)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_project_time ON answer_feedback(project_id, created_at)")
 
 
 def backfill_project_id(conn: sqlite3.Connection, project_id: str) -> int:

@@ -1,0 +1,21 @@
+cases:
+  - id: goal-001
+    question: "项目核心目标是什么"
+    project_id: project-brain
+    expected:
+      intent: project_goal
+      max_key_points: 2
+      max_answer_claims: 2
+      min_confidence: 0.3
+  - id: goal-002
+    question: "这个项目做什么"
+    project_id: project-brain
+    expected:
+      intent: project_goal
+      max_key_points: 2
+  - id: goal-003
+    question: "项目定位是什么"
+    project_id: project-brain
+    expected:
+      intent: project_goal
+      max_key_points: 2

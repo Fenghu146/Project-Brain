@@ -228,6 +228,26 @@ def validate_memory_type(t: str) -> str:
     return t
 
 
+FeedbackVerdict = Literal["accepted", "corrected", "expanded", "irrelevant", "missing_evidence"]
+
+
+class BrainFeedbackRequest(BaseModel):
+    project_id: str
+    agent_id: str
+    session_id: str | None = None
+    question: str
+    answer_claim_ids: list[str] | None = None
+    intent: str | None = None
+    confidence: float | None = None
+    verdict: FeedbackVerdict
+    corrected_text: str | None = None
+
+
+class BrainFeedbackResponse(BaseModel):
+    feedback_id: str
+    event_id: str
+
+
 def validate_memory_status(s: str) -> str:
     if s not in VALID_MEMORY_STATUSES:
         raise ValueError(f"invalid status: {s}")

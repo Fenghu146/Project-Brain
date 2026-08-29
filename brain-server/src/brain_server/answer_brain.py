@@ -3,7 +3,10 @@ from __future__ import annotations
 from typing import Any
 
 from .answer_models import (
+    AnswerClaim,
     AnswerResult,
+    Clarification,
+    ClusterInfo,
     ConfidenceBreakdown,
     IntentType,
     KeyPoint,
@@ -11,6 +14,7 @@ from .answer_models import (
     PollutionTag,
     RelatedContext,
     SourceClass,
+    confidence_label,
 )
 from .intent_router import classify_intent, derive_source_class
 from .models import content_to_text
@@ -106,32 +110,49 @@ class AnswerBrain:
     ) -> AnswerResult:
         """Main entry point for answering questions."""
         from .db import get_connection, init_db
-        from .repository import get_links
-        
+
         conn = get_connection(self.db_path)
         init_db(self.db_path)
         try:
-            # Step 1: Classify intent
+            # Step 1: Classify intent + maybe clarify
             intent, policy = classify_intent(question)
-            
-            # Determine mode based on answer_mode
+            clarification: Clarification | None = None
+            if len(question.strip()) < 12:
+                try:
+                    from .clarification import maybe_clarify
+
+                    clarification = maybe_clarify(question)
+                    if clarification and clarification.needed:
+                        bd = ConfidenceBreakdown()
+                        return AnswerResult(
+                            answer=clarification.prompt,
+                            key_points=[],
+                            clarification=clarification,
+                            intent=intent,
+                            match_mode="none",
+                            confidence=0.0,
+                            confidence_label_text=confidence_label(0.0),
+                            confidence_breakdown=bd,
+                        )
+                except Exception:
+                    pass
+
             if answer_mode == "concise":
                 max_kp = min(policy.get("max_key_points", 3), 3)
             elif answer_mode == "detailed":
                 max_kp = policy.get("max_key_points", 8)
-            else:  # standard
+            else:
                 max_kp = policy.get("max_key_points", 5)
-            
-            # Step 2: Search for candidates
+
             from .search import FTSProvider
+
             provider = FTSProvider()
             results = provider.search(
                 conn, project_id, question,
                 scope=scope or policy.get("preferred_types"),
                 limit=limit * 2,
             )
-            
-            # Track actual match mode from results
+
             match_modes = set()
             for r in results:
                 mm = r.get("match_mode", "fts")
@@ -144,8 +165,7 @@ class AnswerBrain:
                 match_mode = "mixed"
             else:
                 match_mode = "none"
-            
-            # Build matches list for compatibility
+
             matches = [
                 {
                     "id": r["row"]["id"],
@@ -155,43 +175,72 @@ class AnswerBrain:
                 }
                 for r in results
             ]
-            
-            # Step 3: Apply relevance gate
+
             gated_results = self._relevance_gate(results, policy, question)
-            
-            # Step 4: Apply max_key_points limit (P0)
+
+            # Fact clustering (no embedding, Jaccard-based)
+            try:
+                from .clustering import cluster_candidates
+
+                clusters = cluster_candidates(gated_results)
+                # Keep only primary per cluster, preserve score order
+                if clusters:
+                    gated_results = [c["primary"] for c in clusters]
+                    cluster_map = {c["primary_id"]: c for c in clusters}
+                else:
+                    cluster_map = {}
+            except Exception:
+                cluster_map = {}
+
             gated_results = gated_results[:max_kp]
-            
-            # Step 5: Build key points with provenance
-            key_points = self._build_key_points(conn, gated_results, project_id)
-            
-            # Step 6: Filter polluted key points for main answer (P1)
+
+            key_points = self._build_key_points(conn, gated_results, project_id, cluster_map=cluster_map)
             clean_points = self._filter_pollution(key_points, intent)
-            
-            # Step 7: Calculate confidence with breakdown (P2)
+
+            # Refusal: no reliable facts
+            if not clean_points or all(kp.support == "none" for kp in clean_points):
+                bd0 = ConfidenceBreakdown()
+                answer_text = "当前没有足够可靠的已确认事实。"
+                uncertainties = ["已有相关记录，但它们过期/缺少证据/存在冲突。"] if gated_results else ["检索未命中任何候选，已应用相关度阈值过滤低相关结果。"]
+                evidence_list: list[dict[str, Any]] = []
+                try:
+                    evidence_list = self._gather_evidence(conn, gated_results, project_id)
+                except Exception:
+                    pass
+                return AnswerResult(
+                    answer=answer_text,
+                    key_points=[],
+                    clarification=clarification,
+                    facts=[],
+                    evidence=evidence_list,
+                    related_context=self._gather_related_context(results, gated_results),
+                    uncertainties=uncertainties,
+                    next_action=NextAction(type="verify_evidence", reason="证据不足，建议验证关键断言") if clean_points else NextAction(type="record_knowledge", reason="未找到相关记录，建议补充知识"),
+                    intent=intent,
+                    match_mode=match_mode,
+                    confidence=0.0,
+                    confidence_label_text=confidence_label(0.0),
+                    confidence_breakdown=bd0,
+                    provenance=[],
+                    matches=matches,
+                    answer_mode=answer_mode,
+                )
+
             breakdown = self._compute_confidence(conn, gated_results, clean_points, project_id)
-            
-            # Step 8: Compose answer with mode-aware length (P1)
-            answer = self._compose_answer(clean_points, intent, answer_mode)
-            
-            # Step 9: Gather evidence
+            final_conf = breakdown.to_final()
+            answer, claims, hallucination_risk = self._compose_answer(clean_points, intent, answer_mode)
             evidence_list = self._gather_evidence(conn, gated_results, project_id)
-            
-            # Step 10: Gather related context
             related = self._gather_related_context(results, gated_results)
-            
-            # Step 11: Gather uncertainties
             uncertainties = self._gather_uncertainties(gated_results, clean_points, breakdown)
-            
-            # Step 12: Check next actions
             next_action = self._check_next_action(gated_results, clean_points, breakdown)
-            
-            # Step 13: Build provenance
             provenance = self._build_provenance(clean_points, evidence_list)
-            
-            result = AnswerResult(
+
+            return AnswerResult(
                 answer=answer,
                 key_points=clean_points,
+                answer_claims=claims,
+                hallucination_risk=hallucination_risk,
+                clarification=clarification,
                 facts=[],
                 evidence=evidence_list,
                 related_context=related,
@@ -199,13 +248,13 @@ class AnswerBrain:
                 next_action=next_action,
                 intent=intent,
                 match_mode=match_mode,
-                confidence=breakdown.to_final(),
+                confidence=final_conf,
+                confidence_label_text=confidence_label(final_conf),
                 confidence_breakdown=breakdown,
                 provenance=provenance,
                 matches=matches,
+                answer_mode=answer_mode,
             )
-            
-            return result
         finally:
             conn.close()
 
@@ -300,25 +349,21 @@ class AnswerBrain:
         conn: Any,
         results: list[dict[str, Any]],
         project_id: str,
+        cluster_map: dict[str, Any] | None = None,
     ) -> list[KeyPoint]:
         """Build key points with provenance and field extraction (P1)."""
         from .repository import get_links
-        
+
         key_points = []
-        
+
         for c in results:
             row = c.get("row", {})
             score = c.get("score", 0)
             mem_type = row.get("type", "knowledge")
-            
-            # P1: Extract specific fields instead of full content
             text = _extract_memory_field(mem_type, row.get("content", {}))
-            
             links = get_links(conn, from_id=row["id"], project_id=project_id)
             evidence_ids = [lk["to_id"] for lk in links if lk["relation"] == "evidence_of"]
             source_ids = [lk["to_id"] for lk in links if lk["relation"] == "source_of"]
-            
-            # Determine support level with finer granularity
             if evidence_ids:
                 support = "direct"
             elif score > 0.7:
@@ -327,27 +372,28 @@ class AnswerBrain:
                 support = "weak"
             else:
                 support = "none"
-            
-            source_class = derive_source_class(
-                mem_type,
-                row.get("status", "draft"),
-                bool(evidence_ids),
-            )
-            
+            source_class = derive_source_class(mem_type, row.get("status", "draft"), bool(evidence_ids))
             pollution_tags = self._detect_pollution(row, text)
             is_stale = bool(row.get("valid_until") and self._is_stale(row["valid_until"]))
             conflicts = [lk for lk in links if lk["relation"] == "conflicts_with"]
             is_conflicted = len(conflicts) > 0
-            
-            # P2: Add freshness and evidence coverage per key point
             freshness = "current"
             if is_stale:
                 freshness = "stale"
             elif row.get("valid_from") and self._is_future(row["valid_from"]):
                 freshness = "future"
-            
             evidence_coverage = len(evidence_ids) / max(len(links), 1) if links else 0.0
-            
+
+            cluster_info = None
+            if cluster_map and row.get("id") in cluster_map:
+                cinfo = cluster_map[row["id"]]
+                cluster_info = ClusterInfo(
+                    cluster_id=cinfo["cluster_id"],
+                    primary_id=cinfo["primary_id"],
+                    supporting_ids=cinfo.get("supporting_ids", []),
+                    merged_reason=cinfo.get("merged_reason", ""),
+                )
+
             key_point = KeyPoint(
                 text=text[:200],
                 source_ids=[row["id"]] + source_ids,
@@ -359,9 +405,10 @@ class AnswerBrain:
                 is_conflicted=is_conflicted,
                 freshness=freshness,
                 evidence_coverage=round(evidence_coverage, 2),
+                cluster=cluster_info,
             )
             key_points.append(key_point)
-        
+
         return key_points
 
     def _detect_pollution(self, row: dict[str, Any], text: str) -> list[PollutionTag]:
@@ -457,44 +504,50 @@ class AnswerBrain:
         )
 
     def _compose_answer(
-        self, 
-        key_points: list[KeyPoint], 
+        self,
+        key_points: list[KeyPoint],
         intent: IntentType,
         answer_mode: str = "standard",
-    ) -> str:
-        """Compose answer with mode-aware length control (P1)."""
+    ) -> tuple[str, list[AnswerClaim], bool]:
+        """Compose answer with mode-aware length control; returns (answer, claims, hallucination_risk)."""
         if not key_points:
-            return "未找到足够相关的已确认记录。"
-        
-        # Filter out heavily polluted points
+            return "未找到足够相关的已确认记录。", [], False
         clean_points = [
-            kp for kp in key_points 
+            kp for kp in key_points
             if "documentation_example" not in kp.pollution_tags
             and "example_only" not in kp.pollution_tags
         ]
-        
         if not clean_points:
-            return "未找到当前有效的记录，仅有历史或版本规划内容。"
-        
-        # Mode-aware composition
+            return "未找到当前有效的记录，仅有历史或版本规划内容。", [], False
         if answer_mode == "concise":
-            # Only direct and high-confidence indirect
             main_points = [kp for kp in clean_points if kp.support in ("direct", "indirect")][:2]
             if not main_points:
                 main_points = clean_points[:1]
         elif answer_mode == "detailed":
-            # Include all except weak
             main_points = [kp for kp in clean_points if kp.support != "none"][:6]
-        else:  # standard
-            # Direct and indirect, up to 4
+        else:
             main_points = [kp for kp in clean_points if kp.support in ("direct", "indirect")]
             if len(main_points) > 4:
                 main_points = main_points[:4]
-        
-        if main_points:
-            return "；".join(kp.text for kp in main_points)
-        
-        return "找到相关记录但证据不足，建议补充验证。"
+        if not main_points:
+            return "找到相关记录但证据不足，建议补充验证。", [], False
+        answer = "；".join(kp.text for kp in main_points)
+        claims: list[AnswerClaim] = []
+        for kp in main_points:
+            claims.append(AnswerClaim(
+                text=kp.text,
+                key_point_ids=kp.source_ids[:1],
+                evidence_ids=kp.evidence_ids,
+                support=kp.support,
+            ))
+        # Validate: every claim must map to a key_point (by construction it does)
+        hallucination_risk = False
+        valid_ids = {kp.source_ids[0] for kp in main_points if kp.source_ids}
+        for cl in claims:
+            if not any(kid in valid_ids for kid in cl.key_point_ids):
+                hallucination_risk = True
+                break
+        return answer, claims, hallucination_risk
 
     def _gather_evidence(
         self,
@@ -502,23 +555,25 @@ class AnswerBrain:
         results: list[dict[str, Any]],
         project_id: str,
     ) -> list[dict[str, Any]]:
-        """Gather evidence for key points."""
-        from .repository import get_evidence, get_links
-        
+        """Gather evidence for key points with rich display."""
+        from .repository import get_evidence, get_links, resolve_evidence_path
+
         evidence_list = []
         seen_ids = set()
-        
         for c in results:
             row = c.get("row", {})
             links = get_links(conn, from_id=row["id"], project_id=project_id)
-            
             for lk in links:
                 if lk["relation"] == "evidence_of" and lk["to_id"] not in seen_ids:
                     ev = get_evidence(conn, lk["to_id"], project_id=project_id)
                     if ev:
+                        _, health = resolve_evidence_path(ev)
+                        ev = dict(ev)
+                        ev["health"] = health
+                        ev["captured_at"] = ev.get("created_at", "")
+                        ev["summary"] = f"{ev['id']} · {ev.get('source','')} · {ev.get('description','')[:40]} · {ev.get('commit_hash','')[:7] if ev.get('commit_hash') else ''} · {health}".strip(" · ")
                         evidence_list.append(ev)
                         seen_ids.add(lk["to_id"])
-        
         return evidence_list
 
     def _gather_related_context(
