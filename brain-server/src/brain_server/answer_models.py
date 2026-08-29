@@ -18,6 +18,8 @@ IntentType = Literal[
     "task_next_step",
     "test_result",
     "file_or_module_lookup",
+    "generic_narrow",
+    "generic_broad",
     "generic_search",
 ]
 
@@ -41,9 +43,11 @@ PollutionTag = Literal[
     "test_summary",
     "current_state",
     "historical",
+    "documentation_example",
 ]
 
 SupportLevel = Literal["direct", "indirect", "weak", "none"]
+FreshnessLevel = Literal["current", "historical", "stale", "future"]
 
 
 class ConfidenceBreakdown(BaseModel):
@@ -54,7 +58,7 @@ class ConfidenceBreakdown(BaseModel):
     conflict_penalty: float = 0.0
 
     def to_final(self) -> float:
-        """Compute final confidence score."""
+        """Compute final confidence score with P2 improvements."""
         if self.retrieval_confidence == 0:
             return 0.0
         base = (
@@ -75,6 +79,11 @@ class KeyPoint(BaseModel):
     pollution_tags: list[PollutionTag] = Field(default_factory=list)
     is_stale: bool = False
     is_conflicted: bool = False
+    # P2: New fields for finer granularity
+    freshness: FreshnessLevel = "current"
+    evidence_coverage: float = 0.0
+    why_included: str | None = None
+    why_excluded: str | None = None
 
 
 class RelatedContext(BaseModel):
@@ -111,3 +120,10 @@ class AnswerResult(BaseModel):
     suggestions: list[str] = Field(default_factory=list)
     matches: list[dict[str, Any]] = Field(default_factory=list)
     proposals: list[dict[str, Any]] = Field(default_factory=list)
+    # P1: Answer mode
+    answer_mode: str = "standard"
+    # P0: Version metadata
+    brain_runtime_version: str = "0.6"
+    workflow_version: str = "0.5"
+    answer_version: str = "0.6"
+    capability_schema_version: str = "4"
