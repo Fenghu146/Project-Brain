@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""Direct launcher for Project Brain MCP Server.
+
+Resolution order for the database path:
+1. BRAIN_DB_PATH env var (if set and points to an existing file or writable path)
+2. Walk up from CWD looking for a .brain/brain.db or .brain/config.json
+3. Project Brain's own .brain/brain.db (fallback for the brain development project)
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+
+def _find_source_root() -> Path:
+    """Locate the brain-server source root, regardless of where this launcher is invoked from."""
+    candidates: list[Path] = []
+    env_root = os.environ.get("BRAIN_SOURCE_ROOT")
+    if env_root:
+        candidates.append(Path(env_root).expanduser().resolve())
+    candidates.append(Path(__file__).resolve().parent.parent.parent)
+    for c in [
+        Path.home() / "Desktop" / "Project Brain",
+    ]:
+        if c not in candidates:
+            candidates.append(c)
+
+    for cand in candidates:
+        if (cand / "brain-server" / "src").exists():
+            return cand
+    raise RuntimeError("Could not locate brain-server source root")
+
+
+def _resolve_db_path(source_root: Path) -> Path:
+    """Pick the brain.db to use, honoring per-project isolation.
+
+    Search order:
+    1. BRAIN_DB_PATH env var.
+    2. Walk up from CWD looking for a .brain/ directory.
+    3. Scan immediate children of CWD for a .brain/ (one level deep).
+    4. Fallback to the brain dev project's own database.
+    """
+    env_db = os.environ.get("BRAIN_DB_PATH")
+    if env_db:
+        p = Path(env_db).expanduser().resolve()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
+
+    cwd = Path.cwd().resolve()
+
+    # 2. Walk up
+    for directory in [cwd, *cwd.parents]:
+        brain_dir = directory / ".brain"
+        if (brain_dir / "brain.db").exists() or (brain_dir / "config.json").exists():
+            return brain_dir / "brain.db"
+
+    # 3. Scan immediate children of cwd (one level deep) — handles layouts like
+    #    ~/Desktop/Music where the project lives in a subdir.
+    try:
+        for child in cwd.iterdir():
+            if not child.is_dir() or child.name.startswith("."):
+                continue
+            brain_dir = child / ".brain"
+            if (brain_dir / "brain.db").exists() or (brain_dir / "config.json").exists():
+                return brain_dir / "brain.db"
+    except (PermissionError, OSError):
+        pass
+
+    # 4. Fallback
+    return (source_root / ".brain" / "brain.db").resolve()
+
+
+def main() -> int:
+    source_root = _find_source_root()
+    src_path = source_root / "brain-server" / "src"
+    sys.path.insert(0, str(src_path))
+
+    db_path = _resolve_db_path(source_root)
+    os.environ["BRAIN_DB_PATH"] = str(db_path)
+    os.environ["BRAIN_SOURCE_ROOT"] = str(source_root)
+
+    from brain_server.server import main as server_main
+    return server_main()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

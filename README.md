@@ -21,20 +21,95 @@ Project Brain/
 ├── brain-server/           # MCP Server 与 Brain Core
 │   ├── src/
 │   └── tests/
+│   └── bin/                # 启动脚本
 ├── scripts/
 │   ├── init-brain.py
 │   └── brain-demo.py
 ├── docs/
+│   └── MCP-GLOBAL-INSTALL.md
+│   └── AUTO-HOSTED-GUIDE.md
 └── project-brain-v0.1.md
 ```
+
+## 项目自主托管（推荐）
+
+每个项目拥有自己的 `.brain/` 文件夹，数据随项目迁移：
+
+```bash
+# 在项目目录中初始化
+brain init --project my-project --seed
+
+# 会创建 .brain/brain.db，可提交到 git
+```
+
+详见 [docs/AUTO-HOSTED-GUIDE.md](docs/AUTO-HOSTED-GUIDE.md)
 
 ## 快速开始
 
 ```bash
 make init   # 初始化 Brain 数据库与种子数据
-make test   # 运行测试
+make test   # 运行测试 (44 tests passed)
+make eval   # 运行评估 (12 cases, intent_accuracy=1.0)
 make demo   # 端到端 Agent A → B 交接演示
 ```
+
+### 在项目中集成
+
+```bash
+# 1. 进入你的项目目录
+cd /path/to/your-project
+
+# 2. 初始化 Brain
+brain init --project your-project-name --seed
+
+# 3. 使用（在项目目录中）
+brain onboard --agent agent-a
+brain ask --question "项目核心目标是什么"
+```
+
+## MCP Server 全局安装
+
+### 快速配置
+
+```bash
+# 1. 确保 brain-mcp 已安装
+ls -la ~/.local/bin/brain-mcp
+
+# 2. 初始化数据库（首次）
+python3 scripts/init-brain.py --project your-project
+
+# 3. 测试 MCP Server
+PYTHONPATH=brain-server/src python3 -m brain_server.server
+```
+
+### 配置到 AI Agent
+
+**Claude Desktop** (`~/.claude/mcp-config.json`):
+```json
+{
+  "mcpServers": {
+    "project-brain": {
+      "command": "python3",
+      "args": ["/Users/fenghui/Desktop/Project Brain/brain-server/bin/brain-mcp"]
+    }
+  }
+}
+```
+
+**Cursor**: 设置 → MCP → Add MCP Server
+- Name: `project-brain`
+- Command: `python3`
+- Args: `/Users/fenghui/Desktop/Project Brain/brain-server/bin/brain-mcp`
+
+**其他支持 MCP 的 Agent**: 添加上述配置即可使用以下工具：
+- `brain_onboard` - 获取项目上下文
+- `brain_ask` - 查询项目知识
+- `brain_record` - 记录知识/决策/任务
+- `brain_handover` - 会话交接
+- `brain_verify` - 验证记忆
+- `brain_ingest` - 自动采集事件
+
+详细文档见 [docs/MCP-GLOBAL-INSTALL.md](docs/MCP-GLOBAL-INSTALL.md)
 
 ## 协议
 
