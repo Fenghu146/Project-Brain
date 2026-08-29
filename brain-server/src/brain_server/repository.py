@@ -6,26 +6,27 @@ from pathlib import Path
 from typing import Any
 
 from .db import get_connection
-from .models import MEMORY_PREFIX, EVIDENCE_PREFIX, EVENT_PREFIX, HANDOVER_PREFIX, now_iso, content_to_text, ConflictError
+from .models import MEMORY_PREFIX, EVIDENCE_PREFIX, EVENT_PREFIX, HANDOVER_PREFIX, now_iso, content_to_text, expand_chinese_bigrams, build_fts_query, ConflictError
 
 
 def _fts_text(mem_type: str, content: Any, tags: list[str] | None) -> str:
-    parts = [mem_type, content_to_text(content)]
+    parts = [mem_type, expand_chinese_bigrams(content_to_text(content))]
     if tags:
-        parts.append(" ".join(tags))
+        parts.append(expand_chinese_bigrams(" ".join(tags)))
     return " ".join(parts)
 
 
 def _fts_upsert(conn: sqlite3.Connection, mem_id: str, mem_type: str, text: str, project_id: str) -> None:
     """Insert or replace FTS entry for a memory."""
+    indexed = expand_chinese_bigrams(text)
     try:
         conn.execute("INSERT INTO memory_fts (id, type, project_id, text) VALUES (?, ?, ?, ?)",
-                     (mem_id, mem_type, project_id, text))
+                     (mem_id, mem_type, project_id, indexed))
     except Exception:
         # For FTS5, use DELETE + INSERT as REPLACE may not work reliably
         conn.execute("DELETE FROM memory_fts WHERE id=?", (mem_id,))
         conn.execute("INSERT INTO memory_fts (id, type, project_id, text) VALUES (?, ?, ?, ?)",
-                     (mem_id, mem_type, project_id, text))
+                     (mem_id, mem_type, project_id, indexed))
 
 
 def next_id(conn: sqlite3.Connection, prefix: str, table: str, project_id: str | None = None) -> str:
@@ -639,13 +640,13 @@ def _like_fallback(conn: sqlite3.Connection, query: str, limit: int, project_id:
     candidates: list[str] = []
     for t in toks:
         candidates.append(t)
-        if len(t) > 4 and not t.isascii():
+        if not t.isascii() and len(t) >= 2:
             for i in range(len(t) - 1):
                 candidates.append(t[i : i + 2])
     seen_tok: set[str] = set()
     uniq: list[str] = []
     for c in candidates:
-        if c not in seen_tok and len(c) >= 2:
+        if c not in seen_tok and len(c) >= 1:
             seen_tok.add(c)
             uniq.append(c)
     # AND fallback: require all tokens hit (for precise queries like "hello a secret uniqA")
@@ -699,13 +700,17 @@ def fts_search(
     if not query or not query.strip():
         return []
 
+    fts_query = build_fts_query(query)
+    if not fts_query:
+        return _like_fallback(conn, query, limit, project_id=project_id)
+
     fts_rows: list[dict[str, Any]] = []
 
     try:
         cur = conn.execute(
             "SELECT m.* FROM memory_fts f JOIN memories m ON m.id=f.id "
             "WHERE f.project_id=? AND memory_fts MATCH ? ORDER BY rank LIMIT ?",
-            (project_id or "default", query, limit * 3),
+            (project_id or "default", fts_query, limit * 3),
         )
         fts_rows = [_row_to_memory(r) for r in cur.fetchall()]
     except sqlite3.OperationalError:
@@ -716,7 +721,7 @@ def fts_search(
             cur = conn.execute(
                 "SELECT m.* FROM memory_fts f JOIN memories m ON m.id=f.id "
                 "WHERE memory_fts MATCH ? LIMIT ?",
-                (query, limit * 3),
+                (fts_query, limit * 3),
             )
             fts_rows = [_row_to_memory(r) for r in cur.fetchall()]
             if project_id:

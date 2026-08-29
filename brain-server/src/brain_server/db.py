@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -224,7 +225,11 @@ CREATE INDEX IF NOT EXISTS idx_feedback_project_time
 
 
 def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
-    path = Path(db_path) if db_path else DEFAULT_DB_PATH
+    if db_path:
+        path = Path(db_path).expanduser()
+    else:
+        env_db = os.environ.get("BRAIN_DB_PATH")
+        path = Path(env_db).expanduser() if env_db else DEFAULT_DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
@@ -241,6 +246,64 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
 def _ensure_column(conn: sqlite3.Connection, table: str, col: str, ddl: str) -> None:
     if col not in _columns(conn, table):
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
+_FTS_BIGRAM_VERSION = "1"
+
+
+def _maybe_reindex_fts(conn: sqlite3.Connection) -> None:
+    """Rebuild the FTS index if bigram expansion version is stale.
+
+    The indexed `text` field for a memory depends on the version of
+    `expand_chinese_bigrams`. When that function changes, the existing index
+    entries become stale. We track a marker in schema_meta and re-derive all
+    entries on mismatch.
+    """
+    try:
+        cur = conn.execute("SELECT v FROM schema_meta WHERE k='fts_bigram_version'")
+        row = cur.fetchone()
+        current = row["v"] if row else None
+    except sqlite3.OperationalError:
+        current = None
+    if current == _FTS_BIGRAM_VERSION:
+        return
+    try:
+        from .models import expand_chinese_bigrams, content_to_text
+        from .repository import _row_to_memory
+    except Exception:
+        return
+    try:
+        mems = conn.execute("SELECT * FROM memories").fetchall()
+    except sqlite3.OperationalError:
+        mems = []
+    for r in mems:
+        m = _row_to_memory(r)
+        try:
+            content = m.get("content")
+            if isinstance(content, str):
+                text = content
+            else:
+                text = content_to_text(content)
+            tags = m.get("tags") or []
+            if tags and isinstance(tags, str):
+                try:
+                    tags = json.loads(tags)
+                except Exception:
+                    tags = []
+            fts_text = m.get("type", "") + " " + expand_chinese_bigrams(text)
+            if tags:
+                fts_text += " " + expand_chinese_bigrams(" ".join(tags))
+            conn.execute("DELETE FROM memory_fts WHERE id=?", (m["id"],))
+            conn.execute(
+                "INSERT INTO memory_fts (id, type, project_id, text) VALUES (?, ?, ?, ?)",
+                (m["id"], m.get("type", ""), m.get("project_id", "default"), fts_text),
+            )
+        except Exception:
+            continue
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_meta (k, v) VALUES ('fts_bigram_version', ?)",
+        (_FTS_BIGRAM_VERSION,),
+    )
 
 
 def migrate(conn: sqlite3.Connection) -> None:
@@ -307,6 +370,8 @@ def migrate(conn: sqlite3.Connection) -> None:
         conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(id UNINDEXED, type UNINDEXED, project_id UNINDEXED, text)")
     except Exception:
         pass
+    # Re-index FTS when bigram expansion changes (idempotent: checks a schema_meta flag)
+    _maybe_reindex_fts(conn)
     # v0.5: sessions/automation_runs/handover_drafts tables
     conn.execute("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, agent_id TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT, basis_commit TEXT, basis_branch TEXT, status TEXT NOT NULL DEFAULT 'active', last_event_at TEXT, automation_mode TEXT NOT NULL DEFAULT 'full', metadata_json TEXT)")
     conn.execute("CREATE TABLE IF NOT EXISTS automation_runs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, session_id TEXT NOT NULL, trigger TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'running', started_at TEXT NOT NULL, finished_at TEXT, created_event_ids TEXT, created_evidence_ids TEXT, created_proposal_ids TEXT, warnings TEXT, error TEXT)")

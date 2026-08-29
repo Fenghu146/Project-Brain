@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -215,6 +216,71 @@ def content_to_text(content: dict[str, Any] | str) -> str:
     if isinstance(content, str):
         return content
     return json.dumps(content, ensure_ascii=False)
+
+
+_CN_CHAR = re.compile(r"[\u4e00-\u9fff]")
+
+
+def expand_chinese_bigrams(text: str) -> str:
+    """Insert space-joined bigrams for contiguous CJK runs so unicode61 FTS5
+    can index and match Chinese phrases. Non-CJK tokens pass through unchanged.
+
+    "Vinyl 黑胶收藏管理" → "Vinyl 黑胶 胶收 收藏 藏管 管理 黑胶收藏管理"
+    "身份" → "身份 身份"   (duplicate single-char to balance FTS weighting)
+    """
+    if not text:
+        return text
+
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if _CN_CHAR.match(text[i]):
+            j = i
+            while j < n and _CN_CHAR.match(text[j]):
+                j += 1
+            run = text[i:j]
+            if len(run) == 1:
+                out.append(f"{run} {run}")
+            else:
+                bigrams = " ".join(run[k : k + 2] for k in range(len(run) - 1))
+                out.append(f"{bigrams} {run}")
+            i = j
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+def build_fts_query(query: str) -> str:
+    """Transform a user query into an FTS5 MATCH expression that handles
+    CJK via bigram OR-of-terms. Latin tokens are passed through with a `*`
+    prefix wildcard for partial match.
+    """
+    if not query or not query.strip():
+        return ""
+    raw = query.replace("？", " ").replace("?", " ").replace("，", " ").replace(",", " ").strip()
+    toks = [t for t in raw.split() if t.strip()]
+    if not toks:
+        toks = [raw]
+    fts_terms: list[str] = []
+    for t in toks:
+        if _CN_CHAR.search(t):
+            bigrams = expand_chinese_bigrams(t).split()
+            fts_terms.extend(bigrams)
+            if len(t) == 1:
+                fts_terms.append(t)
+        else:
+            cleaned = t.replace('"', "")
+            if cleaned:
+                fts_terms.append(f'"{cleaned}"*')
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for term in fts_terms:
+        if term not in seen:
+            seen.add(term)
+            uniq.append(term)
+    return " OR ".join(uniq) if uniq else ""
 
 
 class ConflictError(Exception):

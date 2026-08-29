@@ -25,7 +25,7 @@ def _matched_terms(query: str, text: str) -> list[str]:
     for t in toks:
         if t.lower() in low_text:
             terms.append(t)
-        elif len(t) > 4 and not t.isascii():
+        elif not t.isascii() and len(t) >= 2:
             for i in range(len(t) - 1):
                 bg = t[i : i + 2]
                 if bg.lower() in low_text and bg not in terms:
