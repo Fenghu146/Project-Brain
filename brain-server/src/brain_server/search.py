@@ -64,11 +64,7 @@ def _has_evidence(conn: sqlite3.Connection, mem_id: str, project_id: str) -> boo
 
 class FTSProvider:
     def search(self, conn: sqlite3.Connection, project_id: str, query: str, scope: list[str] | None, limit: int) -> list[dict[str, Any]]:
-        raw = repo.fts_search(conn, query, limit=limit * 4, project_id=project_id)
-        if isinstance(raw, tuple):
-            raw_candidates, _metrics = raw
-        else:
-            raw_candidates = raw
+        raw_candidates = repo.fts_search(conn, query, limit=limit * 4, project_id=project_id)
         scored: list[tuple[float, str, list[str], dict[str, Any]]] = []
         mode = "fts"
         if not raw_candidates:

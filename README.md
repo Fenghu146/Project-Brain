@@ -6,6 +6,7 @@
 - 第二版方案：`project-brain-v0.2.md`（可靠记忆与项目隔离）
 - 第三版方案：`project-brain-v0.3.md`（主动认知与可审阅 Curator）
 - 第四版方案：`project-brain-v0.4.md`（可迁移、并发与可运营 Brain）
+- 第五版方案：`project-brain-v0.5.md`（Workflow Brain 工作流嵌入层）
 - 计划：`.commandcode/plans/project-brain-v01-prototype-plan.md`
 
 ## 目录结构

@@ -693,7 +693,7 @@ def fts_search(
     query: str,
     limit: int = 20,
     project_id: str | None = None,
-) -> list[dict[str, Any]] | tuple[list[dict[str, Any]], dict[str, int]]:
+) -> list[dict[str, Any]]:
     """FTS search with project isolation."""
     if not query or not query.strip():
         return []
