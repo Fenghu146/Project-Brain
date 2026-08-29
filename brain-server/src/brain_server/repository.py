@@ -213,13 +213,14 @@ def create_evidence(
     path: str | None = None,
     project_root_hint: str | None = None,
     content_hash: str | None = None,
+    commit_hash: str | None = None,
 ) -> str:
     if ev_id is None:
         ev_id = next_id(conn, EVIDENCE_PREFIX, "evidence", project_id=project_id)
     ts = now_iso()
     conn.execute(
-        "INSERT INTO evidence (id, project_id, type, source, description, metadata_json, status, created_at, locator_type, path, project_root_hint, content_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (ev_id, project_id, ev_type, source, description, json.dumps(metadata or {}, ensure_ascii=False), status, ts, locator_type, path, project_root_hint, content_hash),
+        "INSERT INTO evidence (id, project_id, type, source, description, metadata_json, status, created_at, locator_type, path, project_root_hint, content_hash, commit_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (ev_id, project_id, ev_type, source, description, json.dumps(metadata or {}, ensure_ascii=False), status, ts, locator_type, path, project_root_hint, content_hash, commit_hash),
     )
     return ev_id
 
@@ -243,12 +244,12 @@ def get_evidence(conn: sqlite3.Connection, ev_id: str, project_id: str | None = 
         "metadata": json.loads(row["metadata_json"]) if row["metadata_json"] else {},
         "status": row["status"],
         "created_at": row["created_at"],
-        "locator_type": row["locator_type"] if "locator_type" in row.keys() and row["locator_type"] else "absolute",
-        "path": row["path"] if "path" in row.keys() else None,
-        "project_root_hint": row["project_root_hint"] if "project_root_hint" in row.keys() else None,
-        "content_hash": row["content_hash"] if "content_hash" in row.keys() else None,
-        "commit_hash": row["commit_hash"] if "commit_hash" in row.keys() else None,
-        "branch": row["branch"] if "branch" in row.keys() else None,
+        "locator_type": row.get("locator_type") or "absolute",
+        "path": row.get("path"),
+        "project_root_hint": row.get("project_root_hint"),
+        "content_hash": row.get("content_hash"),
+        "commit_hash": row.get("commit_hash"),
+        "branch": row.get("branch"),
     }
 
 
